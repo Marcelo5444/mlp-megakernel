@@ -135,6 +135,25 @@ config across all shapes on the 4090. Compared to the fast heuristic path,
 exhaustive autotune fixed a major regression at M=2048 (0.0583ms → 0.0309ms,
 1.89x improvement) where the heuristic had picked a suboptimal configuration.
 
+#### M=8192: Compute-Bound Comparison (Full Exhaustive Autotune)
+
+At M=8192 the kernel transitions from launch-bound to compute-bound. Full
+3-phase exhaustive autotune on both GPUs, D=H=OUT=128, FP16, FP32 accumulation.
+50 warmup + 100 iterations, median reported.
+
+| GPU | SMs | Best cuTile config | cuTile (ms) | Triton (ms) | PyTorch (ms) | vs Triton | vs PyTorch |
+|-----|-----|---------------------|-------------|-------------|--------------|-----------|------------|
+| RTX 4090 (sm_89) | 128 | TM=64 occ=1 nww=8 lat=(4,2,4,4) tma=15 | 0.0338 | 0.0468 | 0.0573 | 1.38x | 1.70x |
+| GB10 (sm_121) | 48 | TM=32 occ=1 nww=8 lat=(1,4,4,4) tma=15 | 0.0378 | 0.0384 | 0.0620 | 1.02x | 1.64x |
+
+Both GPUs select nww=8 (warp specialization) and occ=1 — at M=8192 there are
+256 tiles, enough to saturate without higher occupancy. The 4090 prefers
+TM=64 (larger tiles, fewer per SM) while GB10 prefers TM=32 (smaller tiles
+to spread work across fewer SMs). On the 4090 cuTile dominates Triton 1.38x;
+on GB10 they tie (1.02x) since Triton's heuristics are already well-tuned for
+that platform. Both crush PyTorch (1.64x–1.70x) thanks to fusion eliminating
+intermediate memory traffic.
+
 ### Optimizations
 
 - **Cached fast-path launcher**: after the first call per shape, precomputes
