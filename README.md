@@ -50,7 +50,8 @@ Detailed optimization journey and benchmark results:
 - Triton >= 2.1
 - CUDA GPU with Tensor Core support (sm_80+)
 
-For cuTile: CUDA 13.3+, cuTile 1.4+, run inside the `cuda133-pytorch-arm64` Docker image.
+For cuTile: CUDA 13.3+, cuTile 1.4+, run inside the `cuda133-pytorch-arm64` (GB10)
+or `cuda133-pytorch-amd64` (x86_64) Docker image.
 
 ## Quick start
 
@@ -113,6 +114,27 @@ shape-dependent heuristic selects TM=32/occ=2, and at M=4096 (1.19x vs Triton,
 2.07x vs PyTorch) where nww=8 (num_worker_warps) provides warp-specialized
 parallelism.
 
+#### NVIDIA RTX 4090 (sm_89, 128 SMs)
+
+Full exhaustive autotune (237 configs/shape, 3-phase search), D=H=OUT=128, FP16,
+FP32 accumulation. CUDA event timing, 50 warmup + 100 iterations, median reported.
+
+| M (batch) | cuTile (ms) | Triton (ms) | PyTorch (ms) | vs Triton | vs PyTorch |
+|------------|-------------|-------------|--------------|-----------|------------|
+| 64 | 0.0310 | 0.0471 | 0.0590 | 1.52x | 1.91x |
+| 128 | 0.0348 | 0.0543 | 0.0655 | 1.56x | 1.88x |
+| 256 | 0.0298 | 0.0461 | 0.0592 | 1.55x | 1.99x |
+| 512 | 0.0307 | 0.0471 | 0.0594 | 1.53x | 1.93x |
+| 1024 | 0.0317 | 0.0491 | 0.0612 | 1.55x | 1.93x |
+| 2048 | 0.0309 | 0.0471 | 0.0594 | 1.53x | 1.92x |
+| 4096 | 0.0307 | 0.0481 | 0.0604 | 1.57x | 1.97x |
+
+cuTile wins at every size, 1.52x–1.57x over Triton and 1.88x–1.99x over PyTorch.
+The full exhaustive autotune found TM=32 TN3=128 occ=2 as the consistent winning
+config across all shapes on the 4090. Compared to the fast heuristic path,
+exhaustive autotune fixed a major regression at M=2048 (0.0583ms → 0.0309ms,
+1.89x improvement) where the heuristic had picked a suboptimal configuration.
+
 ### Optimizations
 
 - **Cached fast-path launcher**: after the first call per shape, precomputes
@@ -128,13 +150,16 @@ parallelism.
 ### Running the benchmark
 
 ```bash
-# Inside the cuda133-pytorch-arm64 Docker container:
+# Inside the cuda133-pytorch Docker container (arm64 for GB10, amd64 for x86_64):
 docker run --rm --gpus all -v /path/to/mlp-megakernel:/work -w /work \
     cuda133-pytorch-arm64:latest python3 profile.py
+# or
+docker run --rm --gpus all -v /path/to/mlp-megakernel:/work -w /work \
+    cuda133-pytorch-amd64:latest python3 profile.py
 
 # Custom sizes:
 docker run --rm --gpus all -v /path/to/mlp-megakernel:/work -w /work \
-    cuda133-pytorch-arm64:latest python3 profile.py --sizes 64,256,1024 --warmup 50 --iters 100
+    cuda133-pytorch-amd64:latest python3 profile.py --sizes 64,256,1024 --warmup 50 --iters 100
 
 # Fast autotune (skip sweep, use heuristic defaults):
 MLP_FAST_AUTOTUNE=1 python3 profile.py --sizes 256
