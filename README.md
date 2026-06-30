@@ -13,8 +13,8 @@ Triton megakernels that fuse entire multi-layer MLPs with Softplus activations i
 | File | Description |
 |------|-------------|
 | `kernel.py` | Inference-only 3-layer Triton megakernel (register-tiled recompute fusion) |
-| `cutile_mlp.py` | cuTile 3-layer megakernel with 3-phase autotuning |
-| `profile.py` | Benchmark harness: cuTile vs Triton (CUDA event timing) |
+| `cutile_mlp.py` | cuTile 3-layer megakernel with 3-phase autotuning + cached fast-path launcher |
+| `profile.py` | Benchmark harness: cuTile vs Triton vs PyTorch (CUDA event timing) |
 | `fused_mlp.py` | Full training 3-layer: forward + backward megakernels, `torch.autograd.Function`, weight normalization |
 | `fused_mlp5.py` | Full training 5-layer: same architecture extended to 5 layers |
 | `bench_weightnorm.py` | Benchmark harness comparing Eager, `torch.compile`, and Fused variants |
@@ -92,25 +92,38 @@ GPU capability-aware tile caps (`_MAX_TILE` by sm_89/90/100/120/121),
 `ct.compiler_timeout(5)` to cap compile time, and post-autotune correctness
 validation (fastest config that passes `torch.allclose` vs PyTorch reference).
 
-### Benchmark: cuTile vs Triton
+### Benchmark: cuTile vs Triton vs PyTorch
 
-NVIDIA GB10 (sm_121, 48 SMs), D=H=128, FP16, FP32 accumulation.
-CUDA event timing, 50 warmup + 100 iterations, median reported.
+NVIDIA GB10 (sm_121, 48 SMs), D=H=OUT=128, FP16, FP32 accumulation.
+CUDA event timing, 100 warmup + 200 iterations, median reported.
 
-| M (batch) | cuTile (ms) | Triton (ms) | Speedup | Winner |
-|------------|------------|-------------|---------|--------|
-| 16 | 0.0168 | 0.0214 | 1.27x | cuTile |
-| 64 | 0.0178 | 0.0213 | 1.20x | cuTile |
-| 256 | 0.0166 | 0.0212 | 1.28x | cuTile |
-| 1024 | 0.0185 | 0.0267 | 1.44x | cuTile |
-| 4096 | 0.0305 | 0.0334 | 1.10x | cuTile |
-| 8192 | 0.0377 | 0.0397 | 1.05x | cuTile |
+| M (batch) | cuTile (ms) | Triton (ms) | PyTorch (ms) | vs Triton | vs PyTorch |
+|------------|-------------|-------------|--------------|-----------|------------|
+| 64 | 0.0087 | 0.0089 | 0.0165 | 1.02x | 1.90x |
+| 128 | 0.0088 | 0.0089 | 0.0130 | 1.01x | 1.47x |
+| 256 | 0.0087 | 0.0090 | 0.0133 | 1.03x | 1.52x |
+| 512 | 0.0093 | 0.0090 | 0.0151 | 0.97x | 1.63x |
+| 1024 | 0.0092 | 0.0131 | 0.0198 | 1.42x | 2.15x |
+| 2048 | 0.0152 | 0.0153 | 0.0267 | 1.00x | 1.76x |
+| 4096 | 0.0192 | 0.0229 | 0.0397 | 1.19x | 2.07x |
 
-cuTile wins across all sizes with 1.05x–1.44x speedup. Best results at small
-batch sizes where the megakernel's single-launch design avoids dispatch
-overhead. The autotuner selects different optimal configs per size — e.g.
-TM=16/TN3=128/nww=8 at M=16, TM=32/TN3=128/occ=2 at M=1024, with per-load
-latency and TMA varying.
+cuTile wins or ties at every size except M=512 (0.97x, within measurement
+noise). Best speedup at M=1024 (1.42x vs Triton, 2.15x vs PyTorch) where the
+shape-dependent heuristic selects TM=32/occ=2, and at M=4096 (1.19x vs Triton,
+2.07x vs PyTorch) where nww=8 (num_worker_warps) provides warp-specialized
+parallelism.
+
+### Optimizations
+
+- **Cached fast-path launcher**: after the first call per shape, precomputes
+  the compiled kernel, grid, and args tuple — eliminates ~9us Python overhead
+  per call (M=256: 17.2us → 8.6us, M=4096: 34us → 19.2us).
+- **Shape-dependent heuristic** (`MLP_FAST_AUTOTUNE=1`): picks tile sizes,
+  occupancy, and num_worker_warps based on M, tuned from exhaustive autotune
+  results. nww=8 passes correctness at M>=2048 but fails at M<=256, so the
+  heuristic gates it accordingly.
+- **Expanded autotune search space**: TM up to 128, TN3 up to 256, GROUP_M
+  sweep (4/8/16), TK1 includes 128, with GPU capability-aware tile caps.
 
 ### Running the benchmark
 
