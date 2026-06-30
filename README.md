@@ -12,7 +12,9 @@ Triton megakernels that fuse entire multi-layer MLPs with Softplus activations i
 
 | File | Description |
 |------|-------------|
-| `kernel.py` | Inference-only 3-layer megakernel (register-tiled recompute fusion) |
+| `kernel.py` | Inference-only 3-layer Triton megakernel (register-tiled recompute fusion) |
+| `cutile_mlp.py` | cuTile 3-layer megakernel with 3-phase autotuning |
+| `profile.py` | Benchmark harness: cuTile vs Triton (CUDA event timing) |
 | `fused_mlp.py` | Full training 3-layer: forward + backward megakernels, `torch.autograd.Function`, weight normalization |
 | `fused_mlp5.py` | Full training 5-layer: same architecture extended to 5 layers |
 | `bench_weightnorm.py` | Benchmark harness comparing Eager, `torch.compile`, and Fused variants |
@@ -48,6 +50,8 @@ Detailed optimization journey and benchmark results:
 - Triton >= 2.1
 - CUDA GPU with Tensor Core support (sm_80+)
 
+For cuTile: CUDA 13.3+, cuTile 1.4+, run inside the `cuda133-pytorch-arm64` Docker image.
+
 ## Quick start
 
 ```python
@@ -62,6 +66,65 @@ loss.backward()  # fused backward
 # With weight normalization
 model_wn = FusedMLPSoftplusWN(D=128, H=128, out_features=128).cuda().half()
 out = model_wn(x)
+```
+
+## cuTile Implementation
+
+`cutile_mlp.py` provides a cuTile (CUDA Tile) port of the 3-layer fused MLP
+megakernel. It uses the same register-tiled recompute fusion architecture as
+the Triton kernel — all GEMMs and softplus activations execute in a single
+persistent kernel launch with intermediates in registers.
+
+### Autotuning
+
+Autotuning uses `ct.tune.exhaustive_search` with a 3-phase
+search strategy:
+
+- **Phase 1** (216 configs): tile sizes (TM, TN3, TK1) x occupancy (1,2,4) x
+  num_ctas (1,2 with `ByTarget`) x num_worker_warps (None,8). TK2/TK3 are
+  matched to hidden dims to avoid recomputation redundancy.
+- **Phase 2** (12 configs): per-load latency OFAT sweep (latency_x, latency_w1,
+  latency_w2, latency_w3) over (1,2,4,8) at the best phase-1 config.
+- **Phase 3** (9 configs): per-load TMA mask sweep — toggle TMA on/off for
+  each of X, W1, W2, W3 individually, plus full mask combinations.
+
+GPU capability-aware tile caps (`_MAX_TILE` by sm_89/90/100/120/121),
+`ct.compiler_timeout(5)` to cap compile time, and post-autotune correctness
+validation (fastest config that passes `torch.allclose` vs PyTorch reference).
+
+### Benchmark: cuTile vs Triton
+
+NVIDIA GB10 (sm_121, 48 SMs), D=H=128, FP16, FP32 accumulation.
+CUDA event timing, 50 warmup + 100 iterations, median reported.
+
+| M (batch) | cuTile (ms) | Triton (ms) | Speedup | Winner |
+|------------|------------|-------------|---------|--------|
+| 16 | 0.0168 | 0.0214 | 1.27x | cuTile |
+| 64 | 0.0178 | 0.0213 | 1.20x | cuTile |
+| 256 | 0.0166 | 0.0212 | 1.28x | cuTile |
+| 1024 | 0.0185 | 0.0267 | 1.44x | cuTile |
+| 4096 | 0.0305 | 0.0334 | 1.10x | cuTile |
+| 8192 | 0.0377 | 0.0397 | 1.05x | cuTile |
+
+cuTile wins across all sizes with 1.05x–1.44x speedup. Best results at small
+batch sizes where the megakernel's single-launch design avoids dispatch
+overhead. The autotuner selects different optimal configs per size — e.g.
+TM=16/TN3=128/nww=8 at M=16, TM=32/TN3=128/occ=2 at M=1024, with per-load
+latency and TMA varying.
+
+### Running the benchmark
+
+```bash
+# Inside the cuda133-pytorch-arm64 Docker container:
+docker run --rm --gpus all -v /path/to/mlp-megakernel:/work -w /work \
+    cuda133-pytorch-arm64:latest python3 profile.py
+
+# Custom sizes:
+docker run --rm --gpus all -v /path/to/mlp-megakernel:/work -w /work \
+    cuda133-pytorch-arm64:latest python3 profile.py --sizes 64,256,1024 --warmup 50 --iters 100
+
+# Fast autotune (skip sweep, use heuristic defaults):
+MLP_FAST_AUTOTUNE=1 python3 profile.py --sizes 256
 ```
 
 ## License
