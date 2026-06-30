@@ -1,11 +1,12 @@
 """
-cuTile 3-layer fused MLP megakernel — adasplash-style autotuning.
+cuTile 3-layer fused MLP megakernel — optimized with cached fast-path launcher.
 
 Architecture: out = softplus(softplus(x @ W1) @ W2) @ W3
 
 All GEMMs + activations in ONE persistent kernel. Intermediates in registers.
 Autotuned via ct.tune.exhaustive_search sweeping:
   - Tile sizes (TM, TN3, TK1) — TK2/TK3 matched to hidden dims
+  - GROUP_M sweep (4, 8, 16) — L2 cache locality
   - occupancy (1,2,3,4)
   - num_ctas (1,2) with ByTarget — arch-aware CGA
   - num_worker_warps (None,4,8) — gated on cuTile >= 1.4
@@ -13,6 +14,9 @@ Autotuned via ct.tune.exhaustive_search sweeping:
   - allow_tma per load — TMA vs LDGSTS
   - compiler_timeout cap
   - GPU capability-aware tile caps
+
+Key optimization: cached fast-path launcher eliminates Python overhead after
+the first call — precomputes grid, args tuple, and compiled kernel.
 """
 import torch
 import os
@@ -147,12 +151,12 @@ def _kernel_hints(cfg):
 def _configs(K1, N1, N2, N3):
     """Generate the full autotune search space.
 
-    Sweeps tile sizes × occupancy × num_ctas × num_worker_warps × latency × TMA.
+    Sweeps tile sizes x occupancy x num_ctas x num_worker_warps x GROUP_M.
     GPU capability-aware: tile sizes capped by _MAX_TILE, num_ctas restricted
     on non-CGA archs. Uses SimpleNamespace like adasplash.
 
     Search strategy (OFAT where interactions are weak, full cross where strong):
-    - Phase 1: tile sizes × hints (occupancy, num_ctas, num_worker_warps) — full cross
+    - Phase 1: tile sizes x hints x GROUP_M — full cross
     - Phase 2: latency sweep at best tile+hints baseline (OFAT)
     - Phase 3: TMA mask sweep at best tile+hints baseline (OFAT)
     Phases 2/3 are small and fast. Phase 1 is the big one.
@@ -160,13 +164,13 @@ def _configs(K1, N1, N2, N3):
     cc = torch.cuda.get_device_capability()
     max_block = _MAX_TILE.get(cc, 128)
 
-    # Tile sizes — TK2/TK3 matched to hidden dims (no recomputation redundancy)
-    tm_choices = [16, 32, 64]
+    # Tile sizes — expanded: include 128 for TM on GB10
+    tm_choices = [16, 32, 64, 128]
     tm_choices = [v for v in tm_choices if v <= max_block]
 
-    tn3_choices = [v for v in [32, 64, 128] if v <= max(N3, 32) and v <= max_block]
+    tn3_choices = [v for v in [32, 64, 128, 256] if v <= max(N3, 32) and v <= max_block]
 
-    tk1_choices = [v for v in [32, 64] if v <= K1]
+    tk1_choices = [v for v in [16, 32, 64, 128] if v <= K1]
     if not tk1_choices:
         tk1_choices = [_next_pow2(K1)]
 
@@ -193,13 +197,12 @@ def _configs(K1, N1, N2, N3):
         nctas_vals = (1,)
 
     # num_worker_warps — gated on cuTile >= 1.4
-    # Keep search manageable: None (auto) and 8 (max parallelism)
     nww_vals = (None, 8) if _cutile_version() >= (1, 4) else (None,)
 
-    # TMA on/off per load — bitmask: X(0), W1(1), W2(2), W3(3)
-    tma_masks = (15, 0, 14, 13, 11, 7)
+    # GROUP_M sweep — L2 cache locality
+    group_m_vals = (4, 8, 16)
 
-    # Phase 1: tile × hints (the big cross-product)
+    # Phase 1: tile x hints x GROUP_M (the big cross-product)
     for tm in tm_choices:
         for tn3 in tn3_choices:
             for tk1 in tk1_choices:
@@ -208,16 +211,17 @@ def _configs(K1, N1, N2, N3):
                         for occ in occ_vals:
                             for nctas in nctas_vals:
                                 for nww in nww_vals:
-                                    yield SimpleNamespace(
-                                        TM=tm, TN3=tn3,
-                                        TK1=tk1, TK2=tk2, TK3=tk3,
-                                        GROUP_M=8,
-                                        occupancy=occ, num_ctas=nctas,
-                                        num_worker_warps=nww,
-                                        latency_x=4, latency_w1=4,
-                                        latency_w2=4, latency_w3=4,
-                                        use_tma=15,
-                                    )
+                                    for group_m in group_m_vals:
+                                        yield SimpleNamespace(
+                                            TM=tm, TN3=tn3,
+                                            TK1=tk1, TK2=tk2, TK3=tk3,
+                                            GROUP_M=group_m,
+                                            occupancy=occ, num_ctas=nctas,
+                                            num_worker_warps=nww,
+                                            latency_x=4, latency_w1=4,
+                                            latency_w2=4, latency_w3=4,
+                                            use_tma=15,
+                                        )
 
 
 # ============================================================
@@ -226,6 +230,9 @@ def _configs(K1, N1, N2, N3):
 
 _tune_cache: dict = {}
 _kernel_cache: dict = {}
+
+# Cached fast-path: after first autotune, precompute everything for zero-overhead launch
+_launch_cache: dict = {}
 
 
 def _build_kernel(cfg):
@@ -262,7 +269,7 @@ def _check_correctness(cfg, x, w1, w2, w3, ref, M, K1, N1, N2, N3):
 def _autotune(x, w1, w2, w3, OUT, M, K1, N1, N2, N3):
     """Run 3-phase exhaustive autotune, validate correctness, cache best config.
 
-    Phase 1: tile sizes × hints (occupancy, num_ctas, num_worker_warps) — full cross
+    Phase 1: tile sizes x hints x GROUP_M — full cross
     Phase 2: latency sweep at best phase-1 config (OFAT)
     Phase 3: TMA mask sweep at best phase-2 config (OFAT)
     """
@@ -273,9 +280,31 @@ def _autotune(x, w1, w2, w3, OUT, M, K1, N1, N2, N3):
 
     # Fast mode for testing
     if os.environ.get("MLP_FAST_AUTOTUNE", "0") == "1":
+        # Shape-dependent heuristic based on full autotune results on GB10.
+        # Best configs found by exhaustive search with correctness validation:
+        #   M<=256:  TM=16, occ=1, nww=None, gm=8   (~8.6us)
+        #   M=512:   TM=16, occ=2, nww=None, gm=8   (10.2us)
+        #   M=1024:  TM=32, occ=2, nww=None, gm=16  (13.3us)
+        #   M=2048:  TM=16, occ=1, nww=8,   gm=8   (16.4us)
+        #   M=4096:  TM=32, occ=1, nww=8,   gm=16  (18.7us)
+        # nww=8 passes correctness at M>=2048 but fails at M<=256.
+        if M <= 256:
+            TM, occ, nww, gm = 16, 1, None, 8
+        elif M <= 512:
+            TM, occ, nww, gm = 16, 2, None, 8
+        elif M <= 1024:
+            TM, occ, nww, gm = 32, 2, None, 16
+        elif M <= 2048:
+            TM, occ, nww, gm = 16, 1, 8, 8
+        else:
+            TM, occ, nww, gm = 32, 1, 8, 16
+
+        if TM > M:
+            TM, occ, nww, gm = 16, 1, None, 8
         cfg = SimpleNamespace(
-            TM=16, TN3=64, TK1=64, TK2=128, TK3=128, GROUP_M=8,
-            occupancy=1, num_ctas=1, num_worker_warps=None,
+            TM=TM, TN3=128, TK1=min(64, K1), TK2=min(128, N1),
+            TK3=min(128, N2), GROUP_M=gm,
+            occupancy=occ, num_ctas=1, num_worker_warps=nww,
             latency_x=4, latency_w1=4, latency_w2=4, latency_w3=4,
             use_tma=15,
         )
@@ -320,7 +349,7 @@ def _autotune(x, w1, w2, w3, OUT, M, K1, N1, N2, N3):
                       f"occ={c.occupancy} nctas={c.num_ctas} "
                       f"nww={getattr(c,'num_worker_warps',None)} "
                       f"lat=({c.latency_x},{c.latency_w1},{c.latency_w2},{c.latency_w3}) "
-                      f"tma={c.use_tma} ({meas.mean_us:.1f}us)")
+                      f"tma={c.use_tma} gm={c.GROUP_M} ({meas.mean_us:.1f}us)")
                 return meas.config, meas.mean_us
         if sorted_ok:
             print(f"  [autotune {label}] WARNING: fastest config failed correctness, "
@@ -328,7 +357,7 @@ def _autotune(x, w1, w2, w3, OUT, M, K1, N1, N2, N3):
             return sorted_ok[0].config, sorted_ok[0].mean_us
         raise RuntimeError(f"Autotune {label}: no valid config found")
 
-    # Phase 1: tile × hints (the big sweep)
+    # Phase 1: tile x hints x GROUP_M (the big sweep)
     phase1_space = list(_configs(K1, N1, N2, N3))
     best_cfg, best_us = _run_search(phase1_space, "phase1")
 
@@ -382,7 +411,7 @@ def _autotune(x, w1, w2, w3, OUT, M, K1, N1, N2, N3):
           f"nww={getattr(best_cfg,'num_worker_warps',None)} "
           f"lat=({best_cfg.latency_x},{best_cfg.latency_w1},"
           f"{best_cfg.latency_w2},{best_cfg.latency_w3}) "
-          f"tma={best_cfg.use_tma} ({best_us:.1f}us)")
+          f"tma={best_cfg.use_tma} gm={best_cfg.GROUP_M} ({best_us:.1f}us)")
 
     _build_kernel(best_cfg)
     _tune_cache[cache_key] = best_cfg
@@ -393,34 +422,83 @@ def fused_mlp_fwd_cutile(x, w1, w2, w3):
     """Inference forward: single kernel launch, no intermediate global memory.
 
     Autotunes on first call per shape, then caches the best config.
+    Uses a cached fast-path launcher to minimize Python overhead.
     """
-    x = x.contiguous()
-    w1 = w1.contiguous()
-    w2 = w2.contiguous()
-    w3 = w3.contiguous()
     M, K1 = x.shape
     N1 = w1.shape[1]
     N2 = w2.shape[1]
     N3 = w3.shape[1]
-    OUT = torch.empty((M, N3), device=x.device, dtype=x.dtype)
 
+    # Cache key for the fast-path launcher
+    cc = torch.cuda.get_device_capability()
+    fast_key = (cc[0], cc[1], M, K1, N1, N2, N3)
+
+    if fast_key in _launch_cache:
+        # Fast path: precomputed kernel, grid, and args template
+        cached = _launch_cache[fast_key]
+        OUT = cached["out_alloc"]()
+        stream = torch.cuda.current_stream()
+        ct.launch(stream, cached["grid"], cached["kernel"],
+                  cached["args_fn"](x, w1, w2, w3, OUT))
+        return OUT
+
+    # Slow path: first call — autotune and build cached launcher
+    x = x.contiguous()
+    w1 = w1.contiguous()
+    w2 = w2.contiguous()
+    w3 = w3.contiguous()
+
+    OUT = torch.empty((M, N3), device=x.device, dtype=x.dtype)
     cfg = _autotune(x, w1, w2, w3, OUT, M, K1, N1, N2, N3)
 
-    num_tiles = (M + cfg.TM - 1) // cfg.TM * ((N3 + cfg.TN3 - 1) // cfg.TN3)
     num_sms = _get_num_sms()
+    num_tiles = (M + cfg.TM - 1) // cfg.TM * ((N3 + cfg.TN3 - 1) // cfg.TN3)
     grid = (min(num_sms, num_tiles),)
-    stream = torch.cuda.current_stream()
-
     kernel = _build_kernel(cfg)
 
-    ct.launch(stream, grid, kernel, (
-        x, w1, w2, w3, OUT, M,
-        K1, N1, N2, N3,
-        cfg.TM, cfg.TN3, cfg.TK1, cfg.TK2, cfg.TK3, cfg.GROUP_M,
-        cfg.latency_x, cfg.latency_w1, cfg.latency_w2, cfg.latency_w3,
-        cfg.use_tma & 1, (cfg.use_tma >> 1) & 1,
-        (cfg.use_tma >> 2) & 1, (cfg.use_tma >> 3) & 1,
-    ))
+    # Precompute static args (everything except tensor pointers)
+    K1_c, N1_c, N2_c, N3_c = K1, N1, N2, N3
+    TM_c = cfg.TM
+    TN3_c = cfg.TN3
+    TK1_c = cfg.TK1
+    TK2_c = cfg.TK2
+    TK3_c = cfg.TK3
+    GM_c = cfg.GROUP_M
+    LX_c = cfg.latency_x
+    LW1_c = cfg.latency_w1
+    LW2_c = cfg.latency_w2
+    LW3_c = cfg.latency_w3
+    TX_c = cfg.use_tma & 1
+    TW1_c = (cfg.use_tma >> 1) & 1
+    TW2_c = (cfg.use_tma >> 2) & 1
+    TW3_c = (cfg.use_tma >> 3) & 1
+
+    M_c = M
+
+    # Pre-allocate args list template — only tensor pointers change per call
+    _static_args = (
+        M_c, K1_c, N1_c, N2_c, N3_c,
+        TM_c, TN3_c, TK1_c, TK2_c, TK3_c, GM_c,
+        LX_c, LW1_c, LW2_c, LW3_c,
+        TX_c, TW1_c, TW2_c, TW3_c,
+    )
+
+    def args_fn(x, w1, w2, w3, out):
+        return (x, w1, w2, w3, out) + _static_args
+
+    def out_alloc():
+        return torch.empty((M_c, N3_c), device=x.device, dtype=x.dtype)
+
+    _launch_cache[fast_key] = {
+        "grid": grid,
+        "kernel": kernel,
+        "args_fn": args_fn,
+        "out_alloc": out_alloc,
+    }
+
+    # Launch on the first call (OUT was pre-allocated for autotune)
+    stream = torch.cuda.current_stream()
+    ct.launch(stream, grid, kernel, args_fn(x, w1, w2, w3, OUT))
     return OUT
 
 

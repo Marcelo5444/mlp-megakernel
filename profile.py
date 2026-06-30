@@ -69,10 +69,17 @@ def correctness_check(x, w1, w2, w3):
     return ct_pass, ct_diff, tr_pass, tr_diff
 
 
+def pytorch_fwd(x, w1, w2, w3):
+    """Plain PyTorch reference: 3 separate matmuls + softplus."""
+    h1 = F.softplus(x @ w1)
+    h2 = F.softplus(h1 @ w2)
+    return h2 @ w3
+
+
 def run_benchmark(sizes, D, H, OUT_F, warmup, iters):
     """Run benchmarks for all sizes and return results."""
     print(f"{'='*80}")
-    print(f"3-Layer Fused MLP Megakernel: cuTile vs Triton")
+    print(f"3-Layer Fused MLP Megakernel: cuTile vs Triton vs PyTorch")
     print(f"Architecture: out = softplus(softplus(x @ W1) @ W2) @ W3")
     print(f"D={D}, H={H}, OUT={OUT_F}, FP16, FP32 accumulation")
     print(f"Warmup={warmup}, Iters={iters}")
@@ -111,29 +118,37 @@ def run_benchmark(sizes, D, H, OUT_F, warmup, iters):
             fused_mlp_fwd_triton, (x, w1, w2, w3), warmup=warmup, iters=iters
         )
 
-        speedup = tr_median / ct_median if ct_median > 0 else float('inf')
+        # Benchmark plain PyTorch
+        pt_median, pt_mean, pt_times = benchmark_fn(
+            pytorch_fwd, (x, w1, w2, w3), warmup=warmup, iters=iters
+        )
+
+        speedup_tr = tr_median / ct_median if ct_median > 0 else float('inf')
+        speedup_pt = pt_median / ct_median if ct_median > 0 else float('inf')
         results.append({
             'M': M, 'D': D, 'H': H, 'OUT_F': OUT_F,
             'ct_median': ct_median, 'ct_mean': ct_mean,
             'tr_median': tr_median, 'tr_mean': tr_mean,
-            'speedup': speedup,
+            'pt_median': pt_median, 'pt_mean': pt_mean,
+            'speedup_tr': speedup_tr, 'speedup_pt': speedup_pt,
         })
 
-        print(f"  cuTile:  median={ct_median:.4f}ms  mean={ct_mean:.4f}ms")
-        print(f"  Triton:  median={tr_median:.4f}ms  mean={tr_mean:.4f}ms")
-        print(f"  Speedup: {speedup:.2f}x ({'cuTile wins' if speedup > 1 else 'Triton wins'})")
+        print(f"  cuTile:   median={ct_median:.4f}ms  mean={ct_mean:.4f}ms")
+        print(f"  Triton:   median={tr_median:.4f}ms  mean={tr_mean:.4f}ms")
+        print(f"  PyTorch:  median={pt_median:.4f}ms  mean={pt_mean:.4f}ms")
+        print(f"  Speedup vs Triton: {speedup_tr:.2f}x ({'cuTile wins' if speedup_tr > 1 else 'Triton wins'})")
+        print(f"  Speedup vs PyTorch: {speedup_pt:.2f}x")
         print()
 
     # Summary table
     print(f"{'='*80}")
     print("SUMMARY")
     print(f"{'='*80}")
-    print(f"{'M':>8} {'cuTile(ms)':>12} {'Triton(ms)':>12} {'Speedup':>10} {'Winner':>12}")
-    print(f"{'-'*8} {'-'*12} {'-'*12} {'-'*10} {'-'*12}")
+    print(f"{'M':>8} {'cuTile(ms)':>12} {'Triton(ms)':>12} {'PyTorch(ms)':>12} {'vs Triton':>10} {'vs PyTorch':>10}")
+    print(f"{'-'*8} {'-'*12} {'-'*12} {'-'*12} {'-'*10} {'-'*10}")
     for r in results:
-        winner = "cuTile" if r['speedup'] > 1 else "Triton"
         print(f"{r['M']:>8} {r['ct_median']:>12.4f} {r['tr_median']:>12.4f} "
-              f"{r['speedup']:>9.2f}x {winner:>12}")
+              f"{r['pt_median']:>12.4f} {r['speedup_tr']:>9.2f}x {r['speedup_pt']:>9.2f}x")
     print()
 
     return results
