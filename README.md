@@ -184,6 +184,36 @@ docker run --rm --gpus all -v /path/to/mlp-megakernel:/work -w /work \
 MLP_FAST_AUTOTUNE=1 python3 profile.py --sizes 256
 ```
 
+## Ablation Study
+
+An ablation study was conducted to understand which optimizations actually
+bring speedup in the cuTile megakernel. Full results in
+[`ablation_report.md`](ablation_report.md).
+
+### Methodology
+
+24 individual parameter variants tested in isolation (OFAT) across 4 batch
+sizes on the RTX 4090 (sm_89, 128 SMs), then 15 combined configurations tested
+across 5 batch sizes. Each variant benchmarked with CUDA events (50 warmup +
+100 iterations, median).
+
+### Key findings
+
+- **M<=1024 is launch-overhead bound.** With 128 SMs and only 1-8 output
+  tiles, all configs cluster at ~12.3us. No config beats the launch floor.
+- **TK1=32 + latency=1 wins 7% at M=4096.** Smaller K1 tiles double the
+  pipeline stages, giving the compiler more overlap opportunities. Applied
+  to the heuristic for sm_89 at M>=4096.
+- **Branchless softplus fails correctness.** `x + log(1 + exp(-|x|))` via
+  `ct.abs` produces 0.06+ max diff — the `where(x>20, x, log(exp(x)+1))`
+  formulation is numerically necessary.
+- **TMA is critical.** Disabling TMA costs 9-20%. Disabling TMA on X only
+  is fine, but disabling on weights hurts significantly.
+- **GROUP_M has no effect.** With TN3=128 and N3=128, there's only 1 output
+  tile column — the swizzle degenerates with no L2 locality to exploit.
+- **opt_level=3 (default) is essential.** opt_level=0 is 4x slower,
+  opt_level=2 matches default.
+
 ## License
 
 MIT

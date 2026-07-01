@@ -280,13 +280,20 @@ def _autotune(x, w1, w2, w3, OUT, M, K1, N1, N2, N3):
 
     # Fast mode for testing
     if os.environ.get("MLP_FAST_AUTOTUNE", "0") == "1":
-        # Shape-dependent heuristic based on full autotune results on GB10.
-        # Best configs found by exhaustive search with correctness validation:
+        # Shape-dependent heuristic based on exhaustive autotune + ablation results.
+        #
+        # GB10 (sm_121, 48 SMs) — from full exhaustive autotune:
         #   M<=256:  TM=16, occ=1, nww=None, gm=8   (~8.6us)
         #   M=512:   TM=16, occ=2, nww=None, gm=8   (10.2us)
         #   M=1024:  TM=32, occ=2, nww=None, gm=16  (13.3us)
         #   M=2048:  TM=16, occ=1, nww=8,   gm=8   (16.4us)
         #   M=4096:  TM=32, occ=1, nww=8,   gm=16  (18.7us)
+        #
+        # RTX 4090 (sm_89, 128 SMs) — from ablation study (ablation_combined.py):
+        #   M<=1024: launch-bound, all configs tie at ~12.3us
+        #   M=4096:  TK1=32 + lat=1 + nww=8 wins 1.07x (14.4us vs 15.4us)
+        #   M=8192:  baseline heuristic already optimal (20.5us)
+        #
         # nww=8 passes correctness at M>=2048 but fails at M<=256.
         if M <= 256:
             TM, occ, nww, gm = 16, 1, None, 8
@@ -301,11 +308,22 @@ def _autotune(x, w1, w2, w3, OUT, M, K1, N1, N2, N3):
 
         if TM > M:
             TM, occ, nww, gm = 16, 1, None, 8
+
+        # Ablation finding: on sm_89 (4090), TK1=32 + latency=1 improves M=4096 by 7%
+        # On GB10 (sm_121), keep TK1=64 + latency=4 (original heuristic)
+        if cc in ((8, 9),) and M >= 4096:
+            tk1 = min(32, K1)
+            lat_x, lat_w1, lat_w2, lat_w3 = 1, 1, 1, 1
+        else:
+            tk1 = min(64, K1)
+            lat_x, lat_w1, lat_w2, lat_w3 = 4, 4, 4, 4
+
         cfg = SimpleNamespace(
-            TM=TM, TN3=128, TK1=min(64, K1), TK2=min(128, N1),
+            TM=TM, TN3=128, TK1=tk1, TK2=min(128, N1),
             TK3=min(128, N2), GROUP_M=gm,
             occupancy=occ, num_ctas=1, num_worker_warps=nww,
-            latency_x=4, latency_w1=4, latency_w2=4, latency_w3=4,
+            latency_x=lat_x, latency_w1=lat_w1,
+            latency_w2=lat_w2, latency_w3=lat_w3,
             use_tma=15,
         )
         _build_kernel(cfg)
