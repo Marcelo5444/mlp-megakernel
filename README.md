@@ -248,6 +248,37 @@ cuTile's Python dispatch overhead is ~45% lower than Triton's (20-22us vs
 comparable to Triton, but cuTile's `ct.launch` is significantly lighter than
 Triton's Python launcher.
 
+### Large batch sizes (M=8192–65536)
+
+Full exhaustive autotune, CUDA graph replay, 50 warmup + 100 iterations, median.
+
+| M | cuTile graph (ms) | Triton graph (ms) | PyTorch graph (ms) | vs Triton (graph) | vs PyTorch (graph) | Best cuTile config |
+|---|---|---|---|---|---|---|
+| 8192 | 0.0141 | 0.0140 | 0.0236 | 0.99x | 1.67x | TM=64 occ=4 nww=8 gm=4 |
+| 16384 | 0.0237 | 0.0225 | 0.0338 | 0.95x | 1.43x | TM=64 occ=1 nww=8 gm=1 |
+| 32768 | 0.0381 | 0.0399 | 0.0522 | 1.05x | 1.37x | TM=64 occ=4 nww=8 gm=1 |
+| 65536 | 0.0696 | 0.0737 | 0.0901 | 1.06x | 1.29x | TM=64 occ=4 nww=8 gm=1 |
+
+With launch overhead included (non-graph):
+
+| M | cuTile (ms) | Triton (ms) | PyTorch (ms) | vs Triton | vs PyTorch |
+|---|---|---|---|---|---|
+| 8192 | 0.0335 | 0.0459 | 0.0584 | 1.37x | 1.74x |
+| 16384 | 0.0430 | 0.0552 | 0.0554 | 1.28x | 1.29x |
+| 32768 | 0.0574 | 0.0748 | 0.0674 | 1.30x | 1.17x |
+| 65536 | 0.0891 | 0.1085 | 0.1044 | 1.22x | 1.17x |
+
+Launch overhead is constant regardless of M: ~19us for cuTile, ~35us for
+Triton. At small M this dominates total time; at M=65536 it's only ~22% of
+cuTile's total.
+
+cuTile's advantage scales with M: as the kernel becomes more compute-bound
+(M>=32768), the exhaustive autotune finds configs that Triton's static
+heuristic can't match. The crossover where cuTile starts winning on pure
+GPU kernel time (not just launch overhead) is around M=32768. At M=65536
+cuTile is 1.06x faster than Triton at the kernel level and 1.22x including
+dispatch.
+
 ## License
 
 MIT
