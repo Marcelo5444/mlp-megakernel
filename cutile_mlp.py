@@ -171,19 +171,19 @@ def _configs(K1, N1, N2, N3):
 
     tn3_choices = [v for v in [64, 128] if v <= max(N3, 32) and v <= max_block]
 
-    tk1_choices = [v for v in [32, 64] if v <= K1]
+    tk1_choices = [v for v in [16, 32, 64] if v <= K1]
     if not tk1_choices:
         tk1_choices = [_next_pow2(K1)]
 
     if N1 >= 128:
-        tk2_choices = [128]
+        tk2_choices = [64, 128]
     elif N1 >= 64:
         tk2_choices = [64]
     else:
         tk2_choices = [_next_pow2(N1)]
 
     if N2 >= 128:
-        tk3_choices = [128]
+        tk3_choices = [64, 128]
     elif N2 >= 64:
         tk3_choices = [64]
     else:
@@ -201,7 +201,7 @@ def _configs(K1, N1, N2, N3):
     nww_vals = (None, 4, 8) if _cutile_version() >= (1, 4) else (None,)
 
     # GROUP_M sweep — L2 cache locality (ablation showed 1 and 2 can win at small M)
-    group_m_vals = (1, 2, 4, 8, 16)
+    group_m_vals = (1,)
 
     # Phase 1: tile x hints x GROUP_M (the big cross-product)
     for tm in tm_choices:
@@ -283,11 +283,14 @@ def _autotune(x, w1, w2, w3, OUT, M, K1, N1, N2, N3):
     if os.environ.get("MLP_FAST_AUTOTUNE", "0") == "1":
         # Shape-dependent heuristic based on exhaustive autotune + ablation results.
         #
-        # RTX 4090 (sm_89, 128 SMs) — from full exhaustive autotune (540 configs/shape):
-        #   M<=256:  TM=16, TN3=64,  occ=2, nww=4, gm=4/1  (~5.9us graph)
-        #   M=1024:  TM=16, TN3=128, occ=2, nww=4, gm=1   (~6.9us graph)
-        #   M=4096:  TM=32, TN3=128, occ=2, nww=4, gm=1   (~11.1us graph)
-        #   M=8192:  TM=64, TN3=128, occ=4, nww=8, gm=8   (~15.5us graph)
+        # RTX 4090 (sm_89, 128 SMs) — from full exhaustive autotune (648 configs/shape):
+        #   M<=256:  TM=16, TN3=64,  occ=2, nww=None, gm=1  (6.0us)
+        #   M=1024:  TM=16, TN3=128, occ=2, nww=4,    gm=1  (7.0us)
+        #   M=4096:  TM=32, TN3=128, occ=2, nww=4,    gm=1  (11.4us, lat_x=2)
+        #   M=8192:  TM=64, TN3=128, occ=4, nww=8,    gm=1  (16.0us, TK1=32, lat_w1=2)
+        #   M=16384: TM=64, TN3=128, occ=1, nww=8,    gm=1  (25.7us, lat_w3=2)
+        #   M=32768: TM=64, TN3=128, occ=1, nww=8,    gm=1  (44.1us)
+        #   M=65536: TM=64, TN3=128, occ=1, nww=8,    gm=1  (76.5us)
         #
         # GB10 (sm_121, 48 SMs) — from full exhaustive autotune:
         #   M<=256:  TM=16, occ=1, nww=None, gm=8   (~8.6us)
@@ -298,17 +301,19 @@ def _autotune(x, w1, w2, w3, OUT, M, K1, N1, N2, N3):
         #
         # nww=8 passes correctness at M>=2048 but fails at M<=256.
         if cc == (8, 9):
-            # RTX 4090 (sm_89) — from full exhaustive autotune with CUDA graph
+            # RTX 4090 (sm_89) — from full exhaustive autotune (648 configs/shape)
             if M <= 256:
-                TM, TN3, occ, nww, gm = 16, 64, 2, 4, 4
+                TM, TN3, occ, nww, gm = 16, 64, 2, None, 1
             elif M <= 1024:
                 TM, TN3, occ, nww, gm = 16, 128, 2, 4, 1
             elif M <= 4096:
                 TM, TN3, occ, nww, gm = 32, 128, 2, 4, 1
+            elif M <= 8192:
+                TM, TN3, occ, nww, gm = 64, 128, 4, 8, 1
             else:
-                TM, TN3, occ, nww, gm = 64, 128, 4, 8, 8
+                TM, TN3, occ, nww, gm = 64, 128, 1, 8, 1
             if TM > M:
-                TM, TN3, occ, nww, gm = 16, 64, 2, 4, 4
+                TM, TN3, occ, nww, gm = 16, 64, 2, None, 1
         else:
             # GB10 and other archs
             if M <= 256:
@@ -326,9 +331,17 @@ def _autotune(x, w1, w2, w3, OUT, M, K1, N1, N2, N3):
                 TM, occ, nww, gm = 16, 1, None, 8
                 TN3 = 128
 
-        # TK1 and latency — same for all archs
+        # TK1 and latency — arch-aware per-shape overrides
         tk1 = min(64, K1)
         lat_x, lat_w1, lat_w2, lat_w3 = 4, 4, 4, 4
+        if cc == (8, 9):
+            if M <= 4096 and M > 1024:
+                lat_x = 2  # M=4096: lat_x=2 wins (11.4us)
+            elif M <= 8192:
+                tk1 = min(32, K1)  # M=8192: TK1=32 wins (16.0us)
+                lat_w1 = 2         # M=8192: lat_w1=2 wins
+            elif M <= 16384:
+                lat_w3 = 2         # M=16384: lat_w3=2 wins (25.7us)
 
         cfg = SimpleNamespace(
             TM=TM, TN3=TN3, TK1=tk1, TK2=min(128, N1),
