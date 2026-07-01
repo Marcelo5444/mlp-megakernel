@@ -164,13 +164,14 @@ def _configs(K1, N1, N2, N3):
     cc = torch.cuda.get_device_capability()
     max_block = _MAX_TILE.get(cc, 128)
 
-    # Tile sizes — expanded: include 128 for TM on GB10
-    tm_choices = [16, 32, 64, 128]
+    # Tile sizes — trimmed: ablation showed TM>=64 and TN3<=32 or TN3>=256 are
+    # always bad for D=H=128 on sm_89. Only include configs that can win.
+    tm_choices = [16, 32, 64]
     tm_choices = [v for v in tm_choices if v <= max_block]
 
-    tn3_choices = [v for v in [32, 64, 128, 256] if v <= max(N3, 32) and v <= max_block]
+    tn3_choices = [v for v in [64, 128] if v <= max(N3, 32) and v <= max_block]
 
-    tk1_choices = [v for v in [16, 32, 64, 128] if v <= K1]
+    tk1_choices = [v for v in [32, 64] if v <= K1]
     if not tk1_choices:
         tk1_choices = [_next_pow2(K1)]
 
@@ -197,10 +198,10 @@ def _configs(K1, N1, N2, N3):
         nctas_vals = (1,)
 
     # num_worker_warps — gated on cuTile >= 1.4
-    nww_vals = (None, 8) if _cutile_version() >= (1, 4) else (None,)
+    nww_vals = (None, 4, 8) if _cutile_version() >= (1, 4) else (None,)
 
-    # GROUP_M sweep — L2 cache locality
-    group_m_vals = (4, 8, 16)
+    # GROUP_M sweep — L2 cache locality (ablation showed 1 and 2 can win at small M)
+    group_m_vals = (1, 2, 4, 8, 16)
 
     # Phase 1: tile x hints x GROUP_M (the big cross-product)
     for tm in tm_choices:
@@ -282,6 +283,12 @@ def _autotune(x, w1, w2, w3, OUT, M, K1, N1, N2, N3):
     if os.environ.get("MLP_FAST_AUTOTUNE", "0") == "1":
         # Shape-dependent heuristic based on exhaustive autotune + ablation results.
         #
+        # RTX 4090 (sm_89, 128 SMs) — from full exhaustive autotune (540 configs/shape):
+        #   M<=256:  TM=16, TN3=64,  occ=2, nww=4, gm=4/1  (~5.9us graph)
+        #   M=1024:  TM=16, TN3=128, occ=2, nww=4, gm=1   (~6.9us graph)
+        #   M=4096:  TM=32, TN3=128, occ=2, nww=4, gm=1   (~11.1us graph)
+        #   M=8192:  TM=64, TN3=128, occ=4, nww=8, gm=8   (~15.5us graph)
+        #
         # GB10 (sm_121, 48 SMs) — from full exhaustive autotune:
         #   M<=256:  TM=16, occ=1, nww=None, gm=8   (~8.6us)
         #   M=512:   TM=16, occ=2, nww=None, gm=8   (10.2us)
@@ -289,37 +296,42 @@ def _autotune(x, w1, w2, w3, OUT, M, K1, N1, N2, N3):
         #   M=2048:  TM=16, occ=1, nww=8,   gm=8   (16.4us)
         #   M=4096:  TM=32, occ=1, nww=8,   gm=16  (18.7us)
         #
-        # RTX 4090 (sm_89, 128 SMs) — from ablation study (ablation_combined.py):
-        #   M<=1024: launch-bound, all configs tie at ~12.3us
-        #   M=4096:  TK1=32 + lat=1 + nww=8 wins 1.07x (14.4us vs 15.4us)
-        #   M=8192:  baseline heuristic already optimal (20.5us)
-        #
         # nww=8 passes correctness at M>=2048 but fails at M<=256.
-        if M <= 256:
-            TM, occ, nww, gm = 16, 1, None, 8
-        elif M <= 512:
-            TM, occ, nww, gm = 16, 2, None, 8
-        elif M <= 1024:
-            TM, occ, nww, gm = 32, 2, None, 16
-        elif M <= 2048:
-            TM, occ, nww, gm = 16, 1, 8, 8
+        if cc == (8, 9):
+            # RTX 4090 (sm_89) — from full exhaustive autotune with CUDA graph
+            if M <= 256:
+                TM, TN3, occ, nww, gm = 16, 64, 2, 4, 4
+            elif M <= 1024:
+                TM, TN3, occ, nww, gm = 16, 128, 2, 4, 1
+            elif M <= 4096:
+                TM, TN3, occ, nww, gm = 32, 128, 2, 4, 1
+            else:
+                TM, TN3, occ, nww, gm = 64, 128, 4, 8, 8
+            if TM > M:
+                TM, TN3, occ, nww, gm = 16, 64, 2, 4, 4
         else:
-            TM, occ, nww, gm = 32, 1, 8, 16
+            # GB10 and other archs
+            if M <= 256:
+                TM, occ, nww, gm = 16, 1, None, 8
+            elif M <= 512:
+                TM, occ, nww, gm = 16, 2, None, 8
+            elif M <= 1024:
+                TM, occ, nww, gm = 32, 2, None, 16
+            elif M <= 2048:
+                TM, occ, nww, gm = 16, 1, 8, 8
+            else:
+                TM, occ, nww, gm = 32, 1, 8, 16
+            TN3 = 128
+            if TM > M:
+                TM, occ, nww, gm = 16, 1, None, 8
+                TN3 = 128
 
-        if TM > M:
-            TM, occ, nww, gm = 16, 1, None, 8
-
-        # Ablation finding: on sm_89 (4090), TK1=32 + latency=1 improves M=4096 by 7%
-        # On GB10 (sm_121), keep TK1=64 + latency=4 (original heuristic)
-        if cc in ((8, 9),) and M >= 4096:
-            tk1 = min(32, K1)
-            lat_x, lat_w1, lat_w2, lat_w3 = 1, 1, 1, 1
-        else:
-            tk1 = min(64, K1)
-            lat_x, lat_w1, lat_w2, lat_w3 = 4, 4, 4, 4
+        # TK1 and latency — same for all archs
+        tk1 = min(64, K1)
+        lat_x, lat_w1, lat_w2, lat_w3 = 4, 4, 4, 4
 
         cfg = SimpleNamespace(
-            TM=TM, TN3=128, TK1=tk1, TK2=min(128, N1),
+            TM=TM, TN3=TN3, TK1=tk1, TK2=min(128, N1),
             TK3=min(128, N2), GROUP_M=gm,
             occupancy=occ, num_ctas=1, num_worker_warps=nww,
             latency_x=lat_x, latency_w1=lat_w1,

@@ -195,24 +195,58 @@ bring speedup in the cuTile megakernel. Full results in
 24 individual parameter variants tested in isolation (OFAT) across 4 batch
 sizes on the RTX 4090 (sm_89, 128 SMs), then 15 combined configurations tested
 across 5 batch sizes. Each variant benchmarked with CUDA events (50 warmup +
-100 iterations, median).
+100 iterations, median). Full exhaustive autotune (540 configs/shape) was
+then run with CUDA graph replay to measure pure GPU kernel time.
 
 ### Key findings
 
 - **M<=1024 is launch-overhead bound.** With 128 SMs and only 1-8 output
   tiles, all configs cluster at ~12.3us. No config beats the launch floor.
-- **TK1=32 + latency=1 wins 7% at M=4096.** Smaller K1 tiles double the
-  pipeline stages, giving the compiler more overlap opportunities. Applied
-  to the heuristic for sm_89 at M>=4096.
+- **With CUDA graphs, cuTile and Triton tie at pure GPU time.** The previous
+  1.5x advantage was entirely Python dispatch overhead (~20-37us per call).
+  cuTile's advantage is its lower launch overhead, not faster kernel code.
+- **Exhaustive autotune finds nww=4 (not nww=8) optimal for small M.** The
+  fast heuristic was updated with per-arch configs from full autotune.
+- **TN3=64 wins at M<=256.** Smaller output tiles create more parallelism
+  when SM utilization is low.
 - **Branchless softplus fails correctness.** `x + log(1 + exp(-|x|))` via
   `ct.abs` produces 0.06+ max diff — the `where(x>20, x, log(exp(x)+1))`
   formulation is numerically necessary.
 - **TMA is critical.** Disabling TMA costs 9-20%. Disabling TMA on X only
   is fine, but disabling on weights hurts significantly.
-- **GROUP_M has no effect.** With TN3=128 and N3=128, there's only 1 output
-  tile column — the swizzle degenerates with no L2 locality to exploit.
+- **GROUP_M has no effect at D=H=OUT=128.** With TN3=128 and N3=128, there's
+  only 1 output tile column — the swizzle degenerates.
 - **opt_level=3 (default) is essential.** opt_level=0 is 4x slower,
   opt_level=2 matches default.
+
+### Benchmark: CUDA graph replay (pure GPU time)
+
+RTX 4090 (sm_89, 128 SMs), D=H=OUT=128, FP16, FP32 accumulation.
+Full exhaustive autotune (540 configs/shape, 3-phase search).
+CUDA graph replay, 50 warmup + 100 iterations, median reported.
+
+| M | cuTile (ms) | Triton (ms) | PyTorch (ms) | vs Triton | vs PyTorch |
+|---|---|---|---|---|---|
+| 64 | 0.0092 | 0.0092 | 0.0123 | 1.00x | 1.33x |
+| 256 | 0.0092 | 0.0092 | 0.0123 | 1.00x | 1.33x |
+| 1024 | 0.0307 | 0.0310 | 0.0348 | 1.01x | 1.13x |
+| 4096 | 0.0113 | 0.0113 | 0.0195 | 1.00x | 1.73x |
+| 8192 | 0.0155 | 0.0143 | 0.0246 | 0.92x | 1.58x |
+
+With launch overhead included (non-graph):
+
+| M | cuTile (ms) | Triton (ms) | PyTorch (ms) | cuTile overhead | Triton overhead |
+|---|---|---|---|---|---|
+| 64 | 0.0299 | 0.0471 | 0.0621 | 0.0206 | 0.0379 |
+| 256 | 0.0297 | 0.0462 | 0.0625 | 0.0205 | 0.0370 |
+| 1024 | 0.1107 | 0.1577 | 0.2058 | 0.0800 | 0.1267 |
+| 4096 | 0.0328 | 0.0501 | 0.0666 | 0.0215 | 0.0388 |
+| 8192 | 0.0358 | 0.0492 | 0.0642 | 0.0203 | 0.0348 |
+
+cuTile's Python dispatch overhead is ~45% lower than Triton's (20-22us vs
+35-38us). This is where cuTile wins in practice — the kernel itself is
+comparable to Triton, but cuTile's `ct.launch` is significantly lighter than
+Triton's Python launcher.
 
 ## License
 
