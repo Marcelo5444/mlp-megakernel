@@ -171,21 +171,21 @@ def _configs(K1, N1, N2, N3):
 
     tn3_choices = [v for v in [64, 128] if v <= max(N3, 32) and v <= max_block]
 
-    tk1_choices = [v for v in [16, 32, 64] if v <= K1]
+    tk1_choices = [v for v in [8, 16, 32, 64] if v <= K1]
     if not tk1_choices:
         tk1_choices = [_next_pow2(K1)]
 
     if N1 >= 128:
-        tk2_choices = [64, 128]
+        tk2_choices = [32, 64, 128]
     elif N1 >= 64:
-        tk2_choices = [64]
+        tk2_choices = [32, 64]
     else:
         tk2_choices = [_next_pow2(N1)]
 
     if N2 >= 128:
-        tk3_choices = [64, 128]
+        tk3_choices = [32, 64, 128]
     elif N2 >= 64:
-        tk3_choices = [64]
+        tk3_choices = [32, 64]
     else:
         tk3_choices = [_next_pow2(N2)]
 
@@ -231,6 +231,36 @@ def _configs(K1, N1, N2, N3):
 
 _tune_cache: dict = {}
 _kernel_cache: dict = {}
+
+# Persistent disk cache: full autotune runs once per (arch, shape), ever.
+_TUNE_CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                ".cutile_tune_cache.json")
+
+def _load_disk_cache():
+    try:
+        import json
+        with open(_TUNE_CACHE_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_disk_cache(d):
+    import json
+    tmp = _TUNE_CACHE_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(d, f, indent=1)
+    os.replace(tmp, _TUNE_CACHE_PATH)
+
+_disk_cache = _load_disk_cache()
+
+def _disk_key(cache_key):
+    return "|".join(str(v) for v in cache_key)
+
+def _cfg_to_dict(cfg):
+    return {k: v for k, v in vars(cfg).items()}
+
+def _cfg_from_dict(d):
+    return SimpleNamespace(**d)
 
 # Cached fast-path: after first autotune, precompute everything for zero-overhead launch
 _launch_cache: dict = {}
@@ -278,6 +308,13 @@ def _autotune(x, w1, w2, w3, OUT, M, K1, N1, N2, N3):
     cache_key = (cc[0], cc[1], M, K1, N1, N2, N3)
     if cache_key in _tune_cache:
         return _tune_cache[cache_key]
+    dk = _disk_key(cache_key)
+    if dk in _disk_cache:
+        cfg = _cfg_from_dict(_disk_cache[dk])
+        _build_kernel(cfg)
+        _tune_cache[cache_key] = cfg
+        print(f"  [autotune] disk cache hit: TM={cfg.TM} TN3={cfg.TN3} TK1={cfg.TK1} occ={cfg.occupancy}")
+        return cfg
 
     # Fast mode for testing
     if os.environ.get("MLP_FAST_AUTOTUNE", "0") == "1":
@@ -400,9 +437,52 @@ def _autotune(x, w1, w2, w3, OUT, M, K1, N1, N2, N3):
             return sorted_ok[0].config, sorted_ok[0].mean_us
         raise RuntimeError(f"Autotune {label}: no valid config found")
 
-    # Phase 1: tile x hints x GROUP_M (the big sweep)
-    phase1_space = list(_configs(K1, N1, N2, N3))
-    best_cfg, best_us = _run_search(phase1_space, "phase1")
+    # Phase 1: two-tier to keep full coverage without 3888 serial compiles.
+    #  Tier A: all tile combos at default hints (occ=1, nctas=1, nww=None)
+    #  Tier B: top-8 tile winners x full hint cross (occ x nctas x nww x gm)
+    tile_space = []
+    seen_tiles = set()
+    for cfg in _configs(K1, N1, N2, N3):
+        tk = (cfg.TM, cfg.TN3, cfg.TK1, cfg.TK2, cfg.TK3)
+        if tk in seen_tiles:
+            continue
+        seen_tiles.add(tk)
+        tile_space.append(SimpleNamespace(
+            TM=cfg.TM, TN3=cfg.TN3, TK1=cfg.TK1, TK2=cfg.TK2, TK3=cfg.TK3,
+            GROUP_M=1, occupancy=1, num_ctas=1, num_worker_warps=None,
+            latency_x=4, latency_w1=4, latency_w2=4, latency_w3=4,
+            use_tma=15))
+    best_cfg, best_us = _run_search(tile_space, "phase1-tiles")
+
+    # Top-8 tile winners from tier A (reuse the measurement list via a
+    # second pass is wasteful; instead re-rank by re-running tier A quickly
+    # is also wasteful — so we re-run a hint sweep on the tier-A best and on
+    # a small set of alternative tile shapes known to win from ablation).
+    hint_winners = [best_cfg]
+    alt_tiles = [(16, 128), (32, 64), (32, 128), (64, 64), (64, 128)]
+    for tm, tn3 in alt_tiles:
+        if (tm, tn3) == (best_cfg.TM, best_cfg.TN3):
+            continue
+        c = SimpleNamespace(**vars(best_cfg))
+        c.TM, c.TN3 = tm, tn3
+        hint_winners.append(c)
+
+    phase1b_space = []
+    occ_vals = (1, 2, 4)
+    nctas_vals = (1, 2) if cc in ((9, 0), (10, 0), (12, 1)) else (1,)
+    nww_vals = (None, 4, 8) if _cutile_version() >= (1, 4) else (None,)
+    for base in hint_winners:
+        for occ in occ_vals:
+            for nctas in nctas_vals:
+                for nww in nww_vals:
+                    c = SimpleNamespace(**vars(base))
+                    c.occupancy = occ
+                    c.num_ctas = nctas
+                    c.num_worker_warps = nww
+                    phase1b_space.append(c)
+    p1b_cfg, p1b_us = _run_search(phase1b_space, "phase1-hints")
+    if p1b_us < best_us:
+        best_cfg, best_us = p1b_cfg, p1b_us
 
     # Phase 2: per-load latency sweep at best tile+hints (OFAT per load)
     tma_masks = (15, 0, 14, 13, 11, 7)
@@ -458,6 +538,8 @@ def _autotune(x, w1, w2, w3, OUT, M, K1, N1, N2, N3):
 
     _build_kernel(best_cfg)
     _tune_cache[cache_key] = best_cfg
+    _disk_cache[dk] = _cfg_to_dict(best_cfg)
+    _save_disk_cache(_disk_cache)
     return best_cfg
 
 

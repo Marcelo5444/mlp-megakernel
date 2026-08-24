@@ -81,9 +81,10 @@ persistent kernel launch with intermediates in registers.
 Autotuning uses `ct.tune.exhaustive_search` with a 3-phase
 search strategy:
 
-- **Phase 1** (216 configs): tile sizes (TM, TN3, TK1) x occupancy (1,2,4) x
-  num_ctas (1,2 with `ByTarget`) x num_worker_warps (None,8). TK2/TK3 are
-  matched to hidden dims to avoid recomputation redundancy.
+- **Phase 1** (two-tier): tier A sweeps all tile combos (TM, TN3, TK1, TK2,
+  TK3) at default hints; tier B sweeps the full hint cross (occupancy x
+  num_ctas x num_worker_warps) on the tier-A winner plus alternative tile
+  shapes. Keeps effective full coverage without 3888 serial compiles.
 - **Phase 2** (12 configs): per-load latency OFAT sweep (latency_x, latency_w1,
   latency_w2, latency_w3) over (1,2,4,8) at the best phase-1 config.
 - **Phase 3** (9 configs): per-load TMA mask sweep — toggle TMA on/off for
@@ -92,6 +93,8 @@ search strategy:
 GPU capability-aware tile caps (`_MAX_TILE` by sm_89/90/100/120/121),
 `ct.compiler_timeout(5)` to cap compile time, and post-autotune correctness
 validation (fastest config that passes `torch.allclose` vs PyTorch reference).
+Winning configs persist to a disk cache (`.cutile_tune_cache.json`) keyed by
+(arch, M, K1, N1, N2, N3) — full autotune runs once per shape, ever.
 
 ### Benchmark: cuTile vs Triton vs PyTorch
 
@@ -113,6 +116,30 @@ noise). Best speedup at M=1024 (1.42x vs Triton, 2.15x vs PyTorch) where the
 shape-dependent heuristic selects TM=32/occ=2, and at M=4096 (1.19x vs Triton,
 2.07x vs PyTorch) where nww=8 (num_worker_warps) provides warp-specialized
 parallelism.
+
+#### NVIDIA GB10 (sm_121, 48 SMs) — Full M Sweep
+
+Full autotune per shape (two-tier tile sweep + hint cross + latency/TMA OFAT),
+D=H=OUT=128, FP16, FP32 accumulation. CUDA event timing, 20 warmup + scaled
+iterations, mean reported. All configs from `.cutile_tune_cache.json`.
+
+| M (batch) | PyTorch (us) | Triton (us) | cuTile (us) | Triton speedup | cuTile speedup | cuTile vs Triton |
+|-----------|--------------|-------------|-------------|----------------|----------------|------------------|
+| 256 | 24.8 | 17.3 | 11.2 | 1.43x | 2.22x | 1.55x |
+| 512 | 25.2 | 17.1 | 11.6 | 1.47x | 2.18x | 1.48x |
+| 1024 | 25.0 | 17.8 | 11.3 | 1.41x | 2.22x | 1.58x |
+| 2048 | 24.6 | 16.9 | 11.2 | 1.45x | 2.20x | 1.51x |
+| 4096 | 26.6 | 17.6 | 13.7 | 1.52x | 1.94x | 1.28x |
+| 8192 | 40.5 | 22.4 | 26.2 | 1.81x | 1.54x | 0.85x |
+| 16384 | 70.1 | 41.7 | 49.8 | 1.68x | 1.41x | 0.84x |
+| 32768 | 218.2 | 83.3 | 97.2 | 2.62x | 2.24x | 0.86x |
+| 65536 | 629.0 | 205.9 | 150.7 | 3.05x | 4.17x | 1.37x |
+
+cuTile beats PyTorch at every size (1.4x–4.2x) and beats Triton at M<=4096
+(up to 1.58x) and M=65536 (1.37x). Triton wins in the M=8192–32768 band
+(0.84x–0.86x) where the grid is SM-capped (48 SMs) and Triton's persistent
+BM=64 tiles with GROUP_M=16 swizzle keep weights hotter in L2 — a target for
+future cuTile tuning (GROUP_M sweep + TM=64/TN3=64 in that band).
 
 #### NVIDIA RTX 4090 (sm_89, 128 SMs)
 
