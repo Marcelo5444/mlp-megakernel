@@ -119,27 +119,29 @@ parallelism.
 
 #### NVIDIA GB10 (sm_121, 48 SMs) — Full M Sweep
 
-Full autotune per shape (two-tier tile sweep + hint cross + latency/TMA OFAT),
-D=H=OUT=128, FP16, FP32 accumulation. CUDA event timing, 20 warmup + scaled
-iterations, mean reported. All configs from `.cutile_tune_cache.json`.
+Full autotune per shape (two-tier tile sweep incl. GROUP_M {1,8,16} + hint
+cross + latency/TMA OFAT), D=H=OUT=128, FP16, FP32 accumulation. CUDA event
+timing, 20 warmup + scaled iterations, mean reported. All configs from
+`.cutile_tune_cache.json`.
 
 | M (batch) | PyTorch (us) | Triton (us) | cuTile (us) | Triton speedup | cuTile speedup | cuTile vs Triton |
 |-----------|--------------|-------------|-------------|----------------|----------------|------------------|
-| 256 | 24.8 | 17.3 | 11.2 | 1.43x | 2.22x | 1.55x |
-| 512 | 25.2 | 17.1 | 11.6 | 1.47x | 2.18x | 1.48x |
-| 1024 | 25.0 | 17.8 | 11.3 | 1.41x | 2.22x | 1.58x |
-| 2048 | 24.6 | 16.9 | 11.2 | 1.45x | 2.20x | 1.51x |
-| 4096 | 26.6 | 17.6 | 13.7 | 1.52x | 1.94x | 1.28x |
-| 8192 | 40.5 | 22.4 | 26.2 | 1.81x | 1.54x | 0.85x |
-| 16384 | 70.1 | 41.7 | 49.8 | 1.68x | 1.41x | 0.84x |
-| 32768 | 218.2 | 83.3 | 97.2 | 2.62x | 2.24x | 0.86x |
-| 65536 | 629.0 | 205.9 | 150.7 | 3.05x | 4.17x | 1.37x |
+| 256 | 25.5 | 17.3 | 10.6 | 1.47x | 2.40x | 1.62x |
+| 512 | 24.7 | 17.2 | 10.8 | 1.44x | 2.29x | 1.59x |
+| 1024 | 24.9 | 17.5 | 11.3 | 1.42x | 2.20x | 1.55x |
+| 2048 | 25.1 | 17.5 | 11.2 | 1.44x | 2.23x | 1.56x |
+| 4096 | 30.8 | 18.2 | 16.6 | 1.69x | 1.85x | 1.09x |
+| 8192 | 47.0 | 25.4 | 29.8 | 1.85x | 1.58x | 0.85x |
+| 16384 | 78.3 | 47.2 | 46.5 | 1.66x | 1.68x | 1.01x |
+| 32768 | 227.4 | 83.1 | 76.6 | 2.74x | 2.97x | 1.08x |
+| 65536 | 554.4 | 193.5 | 155.8 | 2.87x | 3.56x | 1.24x |
 
-cuTile beats PyTorch at every size (1.4x–4.2x) and beats Triton at M<=4096
-(up to 1.58x) and M=65536 (1.37x). Triton wins in the M=8192–32768 band
-(0.84x–0.86x) where the grid is SM-capped (48 SMs) and Triton's persistent
-BM=64 tiles with GROUP_M=16 swizzle keep weights hotter in L2 — a target for
-future cuTile tuning (GROUP_M sweep + TM=64/TN3=64 in that band).
+cuTile beats PyTorch at every size (1.6x–3.6x) and beats Triton at every size
+except M=8192 (0.85x). The GROUP_M sweep (1/8/16) + TK1=128 + TM=64 variants
+were the key additions: they flipped M=16384 (0.84x → 1.01x) and M=32768
+(0.86x → 1.08x) from losses to wins vs Triton — Triton's edge in that band
+comes from its GROUP_M=16 L2 swizzle, and matching it recovers the gap.
+M=8192 (25.4us Triton vs 29.8us cuTile) remains the one losing shape.
 
 #### NVIDIA RTX 4090 (sm_89, 128 SMs)
 

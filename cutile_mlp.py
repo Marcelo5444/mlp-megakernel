@@ -164,14 +164,13 @@ def _configs(K1, N1, N2, N3):
     cc = torch.cuda.get_device_capability()
     max_block = _MAX_TILE.get(cc, 128)
 
-    # Tile sizes — trimmed: ablation showed TM>=64 and TN3<=32 or TN3>=256 are
-    # always bad for D=H=128 on sm_89. Only include configs that can win.
-    tm_choices = [16, 32, 64]
+    # Tile sizes — FULL space (user wants maximum autotune coverage).
+    tm_choices = [16, 32, 64, 128]
     tm_choices = [v for v in tm_choices if v <= max_block]
 
-    tn3_choices = [v for v in [64, 128] if v <= max(N3, 32) and v <= max_block]
+    tn3_choices = [v for v in [64, 128, 256] if v <= max(N3, 32) and v <= max_block]
 
-    tk1_choices = [v for v in [8, 16, 32, 64] if v <= K1]
+    tk1_choices = [v for v in [8, 16, 32, 64, 128] if v <= K1]
     if not tk1_choices:
         tk1_choices = [_next_pow2(K1)]
 
@@ -200,8 +199,9 @@ def _configs(K1, N1, N2, N3):
     # num_worker_warps — gated on cuTile >= 1.4
     nww_vals = (None, 4, 8) if _cutile_version() >= (1, 4) else (None,)
 
-    # GROUP_M sweep — L2 cache locality (ablation showed 1 and 2 can win at small M)
-    group_m_vals = (1,)
+    # GROUP_M sweep — L2 cache locality. Full sweep: Triton's GROUP_M=16 swizzle
+    # is what beats cuTile in the M=8192-32768 band, so this is the key axis.
+    group_m_vals = (1, 8, 16)
 
     # Phase 1: tile x hints x GROUP_M (the big cross-product)
     for tm in tm_choices:
@@ -412,7 +412,7 @@ def _autotune(x, w1, w2, w3, OUT, M, K1, N1, N2, N3):
     def _grid_fn(cfg):
         return (min(num_sms, ct.cdiv(M, cfg.TM) * ct.cdiv(N3, cfg.TN3)),)
 
-    def _run_search(space, label):
+    def _run_search(space, label, keep=0):
         print(f"  [autotune {label}] {len(space)} configs...")
         with ct.compiler_timeout(5):
             result = exhaustive_search(
@@ -422,49 +422,56 @@ def _autotune(x, w1, w2, w3, OUT, M, K1, N1, N2, N3):
             )
         # Sort by speed, pick fastest correct
         sorted_ok = sorted(result.successes, key=lambda m: m.mean_us)
+        kept = []
+        found = None
         for meas in sorted_ok:
             if _check_correctness(meas.config, x, w1, w2, w3, ref, M, K1, N1, N2, N3):
-                c = meas.config
-                print(f"  [autotune {label}] best: TM={c.TM} TN3={c.TN3} "
-                      f"occ={c.occupancy} nctas={c.num_ctas} "
-                      f"nww={getattr(c,'num_worker_warps',None)} "
-                      f"lat=({c.latency_x},{c.latency_w1},{c.latency_w2},{c.latency_w3}) "
-                      f"tma={c.use_tma} gm={c.GROUP_M} ({meas.mean_us:.1f}us)")
-                return meas.config, meas.mean_us
-        if sorted_ok:
-            print(f"  [autotune {label}] WARNING: fastest config failed correctness, "
-                  f"using it anyway")
-            return sorted_ok[0].config, sorted_ok[0].mean_us
-        raise RuntimeError(f"Autotune {label}: no valid config found")
+                if found is None:
+                    found = meas
+                    c = meas.config
+                    print(f"  [autotune {label}] best: TM={c.TM} TN3={c.TN3} "
+                          f"occ={c.occupancy} nctas={c.num_ctas} "
+                          f"nww={getattr(c,'num_worker_warps',None)} "
+                          f"lat=({c.latency_x},{c.latency_w1},{c.latency_w2},{c.latency_w3}) "
+                          f"tma={c.use_tma} gm={c.GROUP_M} ({meas.mean_us:.1f}us)")
+                if len(kept) < keep:
+                    kept.append(meas)
+        if found is None:
+            if sorted_ok:
+                print(f"  [autotune {label}] WARNING: fastest config failed correctness, "
+                      f"using it anyway")
+                return sorted_ok[0].config, sorted_ok[0].mean_us, []
+            raise RuntimeError(f"Autotune {label}: no valid config found")
+        return found.config, found.mean_us, kept
 
     # Phase 1: two-tier to keep full coverage without 3888 serial compiles.
-    #  Tier A: all tile combos at default hints (occ=1, nctas=1, nww=None)
-    #  Tier B: top-8 tile winners x full hint cross (occ x nctas x nww x gm)
+    #  Tier A: all tile combos x GROUP_M at default hints (occ=1, nctas=1, nww=None)
+    #  Tier B: top tile winners x full hint cross (occ x nctas x nww)
     tile_space = []
     seen_tiles = set()
     for cfg in _configs(K1, N1, N2, N3):
-        tk = (cfg.TM, cfg.TN3, cfg.TK1, cfg.TK2, cfg.TK3)
+        tk = (cfg.TM, cfg.TN3, cfg.TK1, cfg.TK2, cfg.TK3, cfg.GROUP_M)
         if tk in seen_tiles:
             continue
         seen_tiles.add(tk)
         tile_space.append(SimpleNamespace(
             TM=cfg.TM, TN3=cfg.TN3, TK1=cfg.TK1, TK2=cfg.TK2, TK3=cfg.TK3,
-            GROUP_M=1, occupancy=1, num_ctas=1, num_worker_warps=None,
+            GROUP_M=cfg.GROUP_M, occupancy=1, num_ctas=1, num_worker_warps=None,
             latency_x=4, latency_w1=4, latency_w2=4, latency_w3=4,
             use_tma=15))
-    best_cfg, best_us = _run_search(tile_space, "phase1-tiles")
+    best_cfg, best_us, tier_a = _run_search(tile_space, "phase1-tiles", keep=12)
 
-    # Top-8 tile winners from tier A (reuse the measurement list via a
-    # second pass is wasteful; instead re-rank by re-running tier A quickly
-    # is also wasteful — so we re-run a hint sweep on the tier-A best and on
-    # a small set of alternative tile shapes known to win from ablation).
-    hint_winners = [best_cfg]
-    alt_tiles = [(16, 128), (32, 64), (32, 128), (64, 64), (64, 128)]
-    for tm, tn3 in alt_tiles:
-        if (tm, tn3) == (best_cfg.TM, best_cfg.TN3):
+    # Tier B: hint sweep on the top-12 tier-A winners (not just the single best —
+    # hints interact with tile shape, so the #1 tile at default hints isn't
+    # necessarily the #1 after hint tuning).
+    hint_winners = []
+    seen_hw = set()
+    for meas in tier_a:
+        c = meas.config
+        key = (c.TM, c.TN3, c.TK1, c.TK2, c.TK3, c.GROUP_M)
+        if key in seen_hw:
             continue
-        c = SimpleNamespace(**vars(best_cfg))
-        c.TM, c.TN3 = tm, tn3
+        seen_hw.add(key)
         hint_winners.append(c)
 
     phase1b_space = []
@@ -475,12 +482,15 @@ def _autotune(x, w1, w2, w3, OUT, M, K1, N1, N2, N3):
         for occ in occ_vals:
             for nctas in nctas_vals:
                 for nww in nww_vals:
+                    if (occ, nctas, nww) == (base.occupancy, base.num_ctas,
+                                             getattr(base, 'num_worker_warps', None)):
+                        continue
                     c = SimpleNamespace(**vars(base))
                     c.occupancy = occ
                     c.num_ctas = nctas
                     c.num_worker_warps = nww
                     phase1b_space.append(c)
-    p1b_cfg, p1b_us = _run_search(phase1b_space, "phase1-hints")
+    p1b_cfg, p1b_us, _ = _run_search(phase1b_space, "phase1-hints", keep=0)
     if p1b_us < best_us:
         best_cfg, best_us = p1b_cfg, p1b_us
 
@@ -498,7 +508,7 @@ def _autotune(x, w1, w2, w3, OUT, M, K1, N1, N2, N3):
             phase2_space.append(c)
 
     if phase2_space:
-        p2_cfg, p2_us = _run_search(phase2_space, "phase2-latency")
+        p2_cfg, p2_us, _ = _run_search(phase2_space, "phase2-latency")
         if p2_us < best_us:
             best_cfg = p2_cfg
             best_us = p2_us
@@ -524,7 +534,7 @@ def _autotune(x, w1, w2, w3, OUT, M, K1, N1, N2, N3):
         phase3_space.append(c)
 
     if phase3_space:
-        p3_cfg, p3_us = _run_search(phase3_space, "phase3-tma")
+        p3_cfg, p3_us, _ = _run_search(phase3_space, "phase3-tma")
         if p3_us < best_us:
             best_cfg = p3_cfg
             best_us = p3_us
