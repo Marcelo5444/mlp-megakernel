@@ -24,6 +24,15 @@ from cutile_mlp import fused_mlp_fwd_cutile
 # --- Triton ---
 from kernel import _fused_mlp_fwd as fused_mlp_fwd_triton
 
+def pytorch_fwd(x, w1, w2, w3):
+    """Plain PyTorch reference: 3 separate matmuls + softplus."""
+    h1 = F.softplus(x @ w1)
+    h2 = F.softplus(h1 @ w2)
+    return h2 @ w3
+
+# torch.compile version of PyTorch reference
+pytorch_fwd_compiled = torch.compile(pytorch_fwd, mode="max-autotune-no-cudagraphs")
+
 
 def benchmark_fn(fn, args, warmup=50, iters=100):
     """Benchmark a function using CUDA events (includes launch overhead)."""
@@ -106,7 +115,7 @@ def pytorch_fwd(x, w1, w2, w3):
     return h2 @ w3
 
 
-def run_benchmark(sizes, D, H, OUT_F, warmup, iters, full_autotune=False):
+def run_benchmark(sizes, D, H, OUT_F, warmup, iters, full_autotune=False, fresh_run=False):
     """Run benchmarks for all sizes and return results."""
     if full_autotune:
         import os
@@ -176,59 +185,73 @@ def run_benchmark(sizes, D, H, OUT_F, warmup, iters, full_autotune=False):
             pytorch_fwd, (x, w1, w2, w3), warmup=warmup, iters=iters
         )
 
+        # Benchmark torch.compile PyTorch
+        ptc_g_median, ptc_g_mean, _ = benchmark_graph(
+            pytorch_fwd_compiled, (x, w1, w2, w3), warmup=warmup, iters=iters
+        )
+        ptc_ng_median, ptc_ng_mean, _ = benchmark_fn(
+            pytorch_fwd_compiled, (x, w1, w2, w3), warmup=warmup, iters=iters
+        )
+
         speedup_tr = tr_g_median / ct_g_median if ct_g_median > 0 else float('inf')
         speedup_pt = pt_g_median / ct_g_median if ct_g_median > 0 else float('inf')
+        speedup_ptc = ptc_g_median / ct_g_median if ct_g_median > 0 else float('inf')
         results.append({
             'M': M, 'D': D, 'H': H, 'OUT_F': OUT_F,
             'ct_g_median': ct_g_median, 'ct_g_mean': ct_g_mean,
             'tr_g_median': tr_g_median, 'tr_g_mean': tr_g_mean,
             'pt_g_median': pt_g_median, 'pt_g_mean': pt_g_mean,
+            'ptc_g_median': ptc_g_median, 'ptc_g_mean': ptc_g_mean,
             'ct_ng_median': ct_ng_median,
             'tr_ng_median': tr_ng_median,
             'pt_ng_median': pt_ng_median,
-            'speedup_tr': speedup_tr, 'speedup_pt': speedup_pt,
+            'ptc_ng_median': ptc_ng_median,
+            'speedup_tr': speedup_tr, 'speedup_pt': speedup_pt, 'speedup_ptc': speedup_ptc,
         })
 
         print(f"  cuTile:   graph={ct_g_median:.4f}ms  no-graph={ct_ng_median:.4f}ms  (overhead={ct_ng_median-ct_g_median:.4f}ms)")
         print(f"  Triton:   graph={tr_g_median:.4f}ms  no-graph={tr_ng_median:.4f}ms  (overhead={tr_ng_median-tr_g_median:.4f}ms)")
         print(f"  PyTorch:  graph={pt_g_median:.4f}ms  no-graph={pt_ng_median:.4f}ms  (overhead={pt_ng_median-pt_g_median:.4f}ms)")
+        print(f"  torch.compile: graph={ptc_g_median:.4f}ms  no-graph={ptc_ng_median:.4f}ms  (overhead={ptc_ng_median-ptc_g_median:.4f}ms)")
         print(f"  Speedup vs Triton (graph): {speedup_tr:.2f}x ({'cuTile wins' if speedup_tr > 1 else 'Triton wins'})")
         print(f"  Speedup vs PyTorch (graph): {speedup_pt:.2f}x")
+        print(f"  Speedup vs torch.compile (graph): {speedup_ptc:.2f}x")
         print()
 
     # Summary table
     print(f"{'='*80}")
     print("SUMMARY (CUDA graph replay — pure GPU time)")
     print(f"{'='*80}")
-    print(f"{'M':>8} {'cuTile(ms)':>12} {'Triton(ms)':>12} {'PyTorch(ms)':>12} {'vs Triton':>10} {'vs PyTorch':>10}")
-    print(f"{'-'*8} {'-'*12} {'-'*12} {'-'*12} {'-'*10} {'-'*10}")
+    print(f"{'M':>8} {'cuTile(ms)':>12} {'Triton(ms)':>12} {'PyTorch(ms)':>12} {'torch.compile(ms)':>16} {'vs Triton':>10} {'vs PyTorch':>10} {'vs T.compile':>12}")
+    print(f"{'-'*8} {'-'*12} {'-'*12} {'-'*12} {'-'*16} {'-'*10} {'-'*10} {'-'*12}")
     for r in results:
         print(f"{r['M']:>8} {r['ct_g_median']:>12.4f} {r['tr_g_median']:>12.4f} "
-              f"{r['pt_g_median']:>12.4f} {r['speedup_tr']:>9.2f}x {r['speedup_pt']:>9.2f}x")
+              f"{r['pt_g_median']:>12.4f} {r['ptc_g_median']:>16.4f} {r['speedup_tr']:>9.2f}x {r['speedup_pt']:>9.2f}x {r['speedup_ptc']:>11.2f}x")
     print()
 
     # Non-graph comparison
     print(f"{'='*80}")
     print("COMPARISON (non-graph — includes launch overhead)")
     print(f"{'='*80}")
-    print(f"{'M':>8} {'cuTile(ms)':>12} {'Triton(ms)':>12} {'PyTorch(ms)':>12}")
-    print(f"{'-'*8} {'-'*12} {'-'*12} {'-'*12}")
+    print(f"{'M':>8} {'cuTile(ms)':>12} {'Triton(ms)':>12} {'PyTorch(ms)':>12} {'torch.compile(ms)':>16}")
+    print(f"{'-'*8} {'-'*12} {'-'*12} {'-'*12} {'-'*16}")
     for r in results:
         print(f"{r['M']:>8} {r['ct_ng_median']:>12.4f} {r['tr_ng_median']:>12.4f} "
-              f"{r['pt_ng_median']:>12.4f}")
+              f"{r['pt_ng_median']:>12.4f} {r['ptc_ng_median']:>16.4f}")
     print()
 
     # Overhead table
     print(f"{'='*80}")
     print("LAUNCH OVERHEAD (non-graph minus graph, in ms)")
     print(f"{'='*80}")
-    print(f"{'M':>8} {'cuTile':>10} {'Triton':>10} {'PyTorch':>10}")
-    print(f"{'-'*8} {'-'*10} {'-'*10} {'-'*10}")
+    print(f"{'M':>8} {'cuTile':>10} {'Triton':>10} {'PyTorch':>10} {'torch.compile':>14}")
+    print(f"{'-'*8} {'-'*10} {'-'*10} {'-'*10} {'-'*14}")
     for r in results:
         ct_oh = r['ct_ng_median'] - r['ct_g_median']
         tr_oh = r['tr_ng_median'] - r['tr_g_median']
         pt_oh = r['pt_ng_median'] - r['pt_g_median']
-        print(f"{r['M']:>8} {ct_oh:>10.4f} {tr_oh:>10.4f} {pt_oh:>10.4f}")
+        ptc_oh = r['ptc_ng_median'] - r['ptc_g_median']
+        print(f"{r['M']:>8} {ct_oh:>10.4f} {tr_oh:>10.4f} {pt_oh:>10.4f} {ptc_oh:>14.4f}")
     print()
 
     return results
@@ -245,7 +268,9 @@ if __name__ == "__main__":
     parser.add_argument('--iters', type=int, default=100, help='Benchmark iterations (default: 100)')
     parser.add_argument('--full-autotune', action='store_true',
                         help='Run full 3-phase exhaustive autotune per shape (slow, ~hours)')
+    parser.add_argument('--fresh-run', action='store_true',
+                        help='Force fresh autotune run ignoring existing cache')
     args = parser.parse_args()
 
     sizes = [int(s) for s in args.sizes.split(',')]
-    run_benchmark(sizes, args.D, args.H, args.OUT, args.warmup, args.iters, args.full_autotune)
+    run_benchmark(sizes, args.D, args.H, args.OUT, args.warmup, args.iters, args.full_autotune, args.fresh_run)
