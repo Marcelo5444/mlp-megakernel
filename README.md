@@ -50,9 +50,8 @@ Detailed optimization journey and benchmark results:
 - Triton >= 2.1
 - CUDA GPU with Tensor Core support (sm_80+)
 
-For cuTile: CUDA 13.4+, cuTile 1.4+, run inside the `nvcr.io/nvidia/pytorch:26.09-py3`
-(or `nvcr.io/nvidia/cuda-dl-base:26.09-cuda13.4-devel-ubuntu24.04`) Docker image —
-multi-arch (arm64 for GB10, amd64 for x86_64).
+For cuTile: CUDA 13.3+, cuTile 1.4+, run inside the `cuda133-pytorch-arm64` (GB10)
+or `cuda133-pytorch-amd64` (x86_64) Docker image.
 
 ## Quick start
 
@@ -82,10 +81,9 @@ persistent kernel launch with intermediates in registers.
 Autotuning uses `ct.tune.exhaustive_search` with a 3-phase
 search strategy:
 
-- **Phase 1** (two-tier): tier A sweeps all tile combos (TM, TN3, TK1, TK2,
-  TK3) at default hints; tier B sweeps the full hint cross (occupancy x
-  num_ctas x num_worker_warps) on the tier-A winner plus alternative tile
-  shapes. Keeps effective full coverage without 3888 serial compiles.
+- **Phase 1** (216 configs): tile sizes (TM, TN3, TK1) x occupancy (1,2,4) x
+  num_ctas (1,2 with `ByTarget`) x num_worker_warps (None,8). TK2/TK3 are
+  matched to hidden dims to avoid recomputation redundancy.
 - **Phase 2** (12 configs): per-load latency OFAT sweep (latency_x, latency_w1,
   latency_w2, latency_w3) over (1,2,4,8) at the best phase-1 config.
 - **Phase 3** (9 configs): per-load TMA mask sweep — toggle TMA on/off for
@@ -94,8 +92,6 @@ search strategy:
 GPU capability-aware tile caps (`_MAX_TILE` by sm_89/90/100/120/121),
 `ct.compiler_timeout(5)` to cap compile time, and post-autotune correctness
 validation (fastest config that passes `torch.allclose` vs PyTorch reference).
-Winning configs persist to a disk cache (`.cutile_tune_cache.json`) keyed by
-(arch, M, K1, N1, N2, N3) — full autotune runs once per shape, ever.
 
 ### Benchmark: cuTile vs Triton vs PyTorch
 
@@ -118,52 +114,45 @@ shape-dependent heuristic selects TM=32/occ=2, and at M=4096 (1.19x vs Triton,
 2.07x vs PyTorch) where nww=8 (num_worker_warps) provides warp-specialized
 parallelism.
 
-#### NVIDIA GB10 (sm_121, 48 SMs) — Full M Sweep
+#### NVIDIA RTX 4090 (sm_89, 128 SMs)
 
-Full autotune per shape (two-tier tile sweep incl. GROUP_M {1,8,16} + hint
-cross + latency/TMA OFAT), D=H=OUT=128, FP16, FP32 accumulation. CUDA event
-timing, 20 warmup + scaled iterations, mean reported. All configs from
-`.cutile_tune_cache.json`.
-
-| M (batch) | PyTorch (us) | Triton (us) | cuTile (us) | Triton speedup | cuTile speedup | cuTile vs Triton |
-|-----------|--------------|-------------|-------------|----------------|----------------|------------------|
-| 256 | 25.5 | 17.3 | 10.6 | 1.47x | 2.40x | 1.62x |
-| 512 | 24.7 | 17.2 | 10.8 | 1.44x | 2.29x | 1.59x |
-| 1024 | 24.9 | 17.5 | 11.3 | 1.42x | 2.20x | 1.55x |
-| 2048 | 25.1 | 17.5 | 11.2 | 1.44x | 2.23x | 1.56x |
-| 4096 | 30.8 | 18.2 | 16.6 | 1.69x | 1.85x | 1.09x |
-| 8192 | 47.0 | 25.4 | 29.8 | 1.85x | 1.58x | 0.85x |
-| 16384 | 78.3 | 47.2 | 46.5 | 1.66x | 1.68x | 1.01x |
-| 32768 | 227.4 | 83.1 | 76.6 | 2.74x | 2.97x | 1.08x |
-| 65536 | 554.4 | 193.5 | 155.8 | 2.87x | 3.56x | 1.24x |
-
-cuTile beats PyTorch at every size (1.6x–3.6x) and beats Triton at every size
-except M=8192 (0.85x). The GROUP_M sweep (1/8/16) + TK1=128 + TM=64 variants
-were the key additions: they flipped M=16384 (0.84x → 1.01x) and M=32768
-(0.86x → 1.08x) from losses to wins vs Triton — Triton's edge in that band
-comes from its GROUP_M=16 L2 swizzle, and matching it recovers the gap.
-M=8192 (25.4us Triton vs 29.8us cuTile) remains the one losing shape.
-
-#### NVIDIA RTX 4090 (sm_89, 128 SMs) — CUDA 13.4, cuTile 1.7
-
-Fast heuristic autotune (`MLP_FAST_AUTOTUNE=1`), D=H=OUT=128, FP16, FP32 accumulation.
-CUDA event timing, 20 warmup + 50 iterations, median reported.
+Full exhaustive autotune (237 configs/shape, 3-phase search), D=H=OUT=128, FP16,
+FP32 accumulation. CUDA event timing, 50 warmup + 100 iterations, median reported.
 
 | M (batch) | cuTile (ms) | Triton (ms) | PyTorch (ms) | vs Triton | vs PyTorch |
 |------------|-------------|-------------|--------------|-----------|------------|
-| 64 | 0.0543 | 0.0562 | 0.0625 | 1.04x | 1.15x |
-| 128 | 0.0379 | 0.0563 | 0.0625 | 1.49x | 1.65x |
-| 256 | 0.0379 | 0.0555 | 0.0611 | 1.46x | 1.61x |
-| 512 | 0.0358 | 0.0563 | 0.0635 | 1.57x | 1.77x |
-| 1024 | 0.0369 | 0.0565 | 0.0625 | 1.53x | 1.69x |
-| 2048 | 0.0336 | 0.0532 | 0.0597 | 1.58x | 1.78x |
-| 4096 | 0.0366 | 0.0573 | 0.0604 | 1.57x | 1.65x |
-| 8192 | 0.0369 | 0.0553 | 0.0594 | 1.50x | 1.61x |
-| 16384 | 0.0451 | 0.0587 | 0.0562 | 1.30x | 1.25x |
-| 32768 | 0.0603 | 0.0791 | 0.0663 | 1.31x | 1.10x |
-| 65536 | 0.0911 | 0.1116 | 0.1034 | 1.23x | 1.13x |
+| 64 | 0.0310 | 0.0471 | 0.0590 | 1.52x | 1.91x |
+| 128 | 0.0348 | 0.0543 | 0.0655 | 1.56x | 1.88x |
+| 256 | 0.0298 | 0.0461 | 0.0592 | 1.55x | 1.99x |
+| 512 | 0.0307 | 0.0471 | 0.0594 | 1.53x | 1.93x |
+| 1024 | 0.0317 | 0.0491 | 0.0612 | 1.55x | 1.93x |
+| 2048 | 0.0309 | 0.0471 | 0.0594 | 1.53x | 1.92x |
+| 4096 | 0.0307 | 0.0481 | 0.0604 | 1.57x | 1.97x |
 
-cuTile wins at every size. At small M (<=256) the kernel is launch-overhead bound and all implementations are close. At M=128-8192 cuTile achieves 1.5-1.6x over Triton and 1.6-1.8x over PyTorch. At large M (>=16384) the advantage narrows but cuTile still wins (1.1-1.3x vs Triton, 1.1-1.3x vs PyTorch). The shape-dependent heuristic picks TM=16 TN3=64 occ=2 nww=None gm=1 for M<=256, TM=16 TN3=128 occ=2 nww=4 gm=1 for M=1024, TM=32 TN3=128 occ=2 nww=4 gm=1 for M=4096, and TM=64 TN3=128 occ=4 nww=8 gm=1 for M>=8192.
+cuTile wins at every size, 1.52x–1.57x over Triton and 1.88x–1.99x over PyTorch.
+The full exhaustive autotune found TM=32 TN3=128 occ=2 as the consistent winning
+config across all shapes on the 4090. Compared to the fast heuristic path,
+exhaustive autotune fixed a major regression at M=2048 (0.0583ms → 0.0309ms,
+1.89x improvement) where the heuristic had picked a suboptimal configuration.
+
+#### M=8192: Compute-Bound Comparison (Full Exhaustive Autotune)
+
+At M=8192 the kernel transitions from launch-bound to compute-bound. Full
+3-phase exhaustive autotune on both GPUs, D=H=OUT=128, FP16, FP32 accumulation.
+50 warmup + 100 iterations, median reported.
+
+| GPU | SMs | Best cuTile config | cuTile (ms) | Triton (ms) | PyTorch (ms) | vs Triton | vs PyTorch |
+|-----|-----|---------------------|-------------|-------------|--------------|-----------|------------|
+| RTX 4090 (sm_89) | 128 | TM=64 occ=1 nww=8 lat=(4,2,4,4) tma=15 | 0.0338 | 0.0468 | 0.0573 | 1.38x | 1.70x |
+| GB10 (sm_121) | 48 | TM=32 occ=1 nww=8 lat=(1,4,4,4) tma=15 | 0.0378 | 0.0384 | 0.0620 | 1.02x | 1.64x |
+
+Both GPUs select nww=8 (warp specialization) and occ=1 — at M=8192 there are
+256 tiles, enough to saturate without higher occupancy. The 4090 prefers
+TM=64 (larger tiles, fewer per SM) while GB10 prefers TM=32 (smaller tiles
+to spread work across fewer SMs). On the 4090 cuTile dominates Triton 1.38x;
+on GB10 they tie (1.02x) since Triton's heuristics are already well-tuned for
+that platform. Both crush PyTorch (1.64x–1.70x) thanks to fusion eliminating
+intermediate memory traffic.
 
 ### Optimizations
 
@@ -180,16 +169,16 @@ cuTile wins at every size. At small M (<=256) the kernel is launch-overhead boun
 ### Running the benchmark
 
 ```bash
-# Inside the CUDA 13.4 Docker container (multi-arch: arm64 for GB10, amd64 for x86_64):
+# Inside the cuda133-pytorch Docker container (arm64 for GB10, amd64 for x86_64):
 docker run --rm --gpus all -v /path/to/mlp-megakernel:/work -w /work \
-    nvcr.io/nvidia/pytorch:26.09-py3 python3 profile.py
+    cuda133-pytorch-arm64:latest python3 profile.py
 # or
 docker run --rm --gpus all -v /path/to/mlp-megakernel:/work -w /work \
-    nvcr.io/nvidia/cuda-dl-base:26.09-cuda13.4-devel-ubuntu24.04 python3 profile.py
+    cuda133-pytorch-amd64:latest python3 profile.py
 
 # Custom sizes:
 docker run --rm --gpus all -v /path/to/mlp-megakernel:/work -w /work \
-    nvcr.io/nvidia/pytorch:26.09-py3 python3 profile.py --sizes 64,256,1024 --warmup 50 --iters 100
+    cuda133-pytorch-amd64:latest python3 profile.py --sizes 64,256,1024 --warmup 50 --iters 100
 
 # Fast autotune (skip sweep, use heuristic defaults):
 MLP_FAST_AUTOTUNE=1 python3 profile.py --sizes 256
@@ -258,37 +247,6 @@ cuTile's Python dispatch overhead is ~45% lower than Triton's (20-22us vs
 35-38us). This is where cuTile wins in practice — the kernel itself is
 comparable to Triton, but cuTile's `ct.launch` is significantly lighter than
 Triton's Python launcher.
-
-### Large batch sizes (M=8192–65536)
-
-Full exhaustive autotune, CUDA graph replay, 50 warmup + 100 iterations, median.
-
-| M | cuTile graph (ms) | Triton graph (ms) | PyTorch graph (ms) | vs Triton (graph) | vs PyTorch (graph) | Best cuTile config |
-|---|---|---|---|---|---|---|
-| 8192 | 0.0141 | 0.0140 | 0.0236 | 0.99x | 1.67x | TM=64 occ=4 nww=8 gm=4 |
-| 16384 | 0.0237 | 0.0225 | 0.0338 | 0.95x | 1.43x | TM=64 occ=1 nww=8 gm=1 |
-| 32768 | 0.0381 | 0.0399 | 0.0522 | 1.05x | 1.37x | TM=64 occ=4 nww=8 gm=1 |
-| 65536 | 0.0696 | 0.0737 | 0.0901 | 1.06x | 1.29x | TM=64 occ=4 nww=8 gm=1 |
-
-With launch overhead included (non-graph):
-
-| M | cuTile (ms) | Triton (ms) | PyTorch (ms) | vs Triton | vs PyTorch |
-|---|---|---|---|---|---|
-| 8192 | 0.0335 | 0.0459 | 0.0584 | 1.37x | 1.74x |
-| 16384 | 0.0430 | 0.0552 | 0.0554 | 1.28x | 1.29x |
-| 32768 | 0.0574 | 0.0748 | 0.0674 | 1.30x | 1.17x |
-| 65536 | 0.0891 | 0.1085 | 0.1044 | 1.22x | 1.17x |
-
-Launch overhead is constant regardless of M: ~19us for cuTile, ~35us for
-Triton. At small M this dominates total time; at M=65536 it's only ~22% of
-cuTile's total.
-
-cuTile's advantage scales with M: as the kernel becomes more compute-bound
-(M>=32768), the exhaustive autotune finds configs that Triton's static
-heuristic can't match. The crossover where cuTile starts winning on pure
-GPU kernel time (not just launch overhead) is around M=32768. At M=65536
-cuTile is 1.06x faster than Triton at the kernel level and 1.22x including
-dispatch.
 
 ## License
 

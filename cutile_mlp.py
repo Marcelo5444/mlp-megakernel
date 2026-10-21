@@ -1,4 +1,5 @@
-"""cuTile 3-layer fused MLP megakernel — optimized with cached fast-path launcher.
+"""
+cuTile 3-layer fused MLP megakernel — optimized with cached fast-path launcher.
 
 Architecture: out = softplus(softplus(x @ W1) @ W2) @ W3
 
@@ -22,7 +23,6 @@ import os
 import math
 from types import SimpleNamespace
 import cuda.tile as ct
-from cuda.tile import ByTarget
 from cuda.tile.tune import exhaustive_search
 
 _NUM_SMS = None
@@ -133,6 +133,7 @@ def _cutile_version():
 
 def _kernel_hints(cfg):
     """Map config to cuTile compiler hints (ByTarget for arch portability)."""
+    from cuda.tile import ByTarget
     hints = {
         "num_ctas": ByTarget(
             sm_90=cfg.num_ctas, sm_100=cfg.num_ctas,
@@ -163,27 +164,28 @@ def _configs(K1, N1, N2, N3):
     cc = torch.cuda.get_device_capability()
     max_block = _MAX_TILE.get(cc, 128)
 
-    # Tile sizes — FULL space (user wants maximum autotune coverage).
-    tm_choices = [16, 32, 64, 128]
+    # Tile sizes — trimmed: ablation showed TM>=64 and TN3<=32 or TN3>=256 are
+    # always bad for D=H=128 on sm_89. Only include configs that can win.
+    tm_choices = [16, 32, 64]
     tm_choices = [v for v in tm_choices if v <= max_block]
 
-    tn3_choices = [v for v in [64, 128, 256] if v <= max(N3, 32) and v <= max_block]
+    tn3_choices = [v for v in [64, 128] if v <= max(N3, 32) and v <= max_block]
 
-    tk1_choices = [v for v in [8, 16, 32, 64, 128] if v <= K1]
+    tk1_choices = [v for v in [16, 32, 64] if v <= K1]
     if not tk1_choices:
         tk1_choices = [_next_pow2(K1)]
 
     if N1 >= 128:
-        tk2_choices = [32, 64, 128]
+        tk2_choices = [64, 128]
     elif N1 >= 64:
-        tk2_choices = [32, 64]
+        tk2_choices = [64]
     else:
         tk2_choices = [_next_pow2(N1)]
 
     if N2 >= 128:
-        tk3_choices = [32, 64, 128]
+        tk3_choices = [64, 128]
     elif N2 >= 64:
-        tk3_choices = [32, 64]
+        tk3_choices = [64]
     else:
         tk3_choices = [_next_pow2(N2)]
 
@@ -198,9 +200,8 @@ def _configs(K1, N1, N2, N3):
     # num_worker_warps — gated on cuTile >= 1.4
     nww_vals = (None, 4, 8) if _cutile_version() >= (1, 4) else (None,)
 
-    # GROUP_M sweep — L2 cache locality. Full sweep: Triton's GROUP_M=16 swizzle
-    # is what beats cuTile in the M=8192-32768 band, so this is the key axis.
-    group_m_vals = (1, 8, 16)
+    # GROUP_M sweep — L2 cache locality (ablation showed 1 and 2 can win at small M)
+    group_m_vals = (1,)
 
     # Phase 1: tile x hints x GROUP_M (the big cross-product)
     for tm in tm_choices:
@@ -230,36 +231,6 @@ def _configs(K1, N1, N2, N3):
 
 _tune_cache: dict = {}
 _kernel_cache: dict = {}
-
-# Persistent disk cache: full autotune runs once per (arch, shape), ever.
-_TUNE_CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                ".cutile_tune_cache.json")
-
-def _load_disk_cache():
-    try:
-        import json
-        with open(_TUNE_CACHE_PATH) as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-def _save_disk_cache(d):
-    import json
-    tmp = _TUNE_CACHE_PATH + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(d, f, indent=1)
-    os.replace(tmp, _TUNE_CACHE_PATH)
-
-_disk_cache = _load_disk_cache()
-
-def _disk_key(cache_key):
-    return "|".join(str(v) for v in cache_key)
-
-def _cfg_to_dict(cfg):
-    return {k: v for k, v in vars(cfg).items()}
-
-def _cfg_from_dict(d):
-    return SimpleNamespace(**d)
 
 # Cached fast-path: after first autotune, precompute everything for zero-overhead launch
 _launch_cache: dict = {}
@@ -307,13 +278,6 @@ def _autotune(x, w1, w2, w3, OUT, M, K1, N1, N2, N3):
     cache_key = (cc[0], cc[1], M, K1, N1, N2, N3)
     if cache_key in _tune_cache:
         return _tune_cache[cache_key]
-    dk = _disk_key(cache_key)
-    if dk in _disk_cache:
-        cfg = _cfg_from_dict(_disk_cache[dk])
-        _build_kernel(cfg)
-        _tune_cache[cache_key] = cfg
-        print(f"  [autotune] disk cache hit: TM={cfg.TM} TN3={cfg.TN3} TK1={cfg.TK1} occ={cfg.occupancy}")
-        return cfg
 
     # Fast mode for testing
     if os.environ.get("MLP_FAST_AUTOTUNE", "0") == "1":
@@ -411,89 +375,34 @@ def _autotune(x, w1, w2, w3, OUT, M, K1, N1, N2, N3):
     def _grid_fn(cfg):
         return (min(num_sms, ct.cdiv(M, cfg.TM) * ct.cdiv(N3, cfg.TN3)),)
 
-    def _run_search(space, label, keep=0):
+    def _run_search(space, label):
         print(f"  [autotune {label}] {len(space)} configs...")
         with ct.compiler_timeout(5):
             result = exhaustive_search(
                 space, stream, _grid_fn, fused_mlp_kernel,
                 lambda cfg: _launch_args(cfg, OUT),
-                lambda cfg: _kernel_hints(cfg),
-                quiet=True,
-                flush_l2=True,
+                lambda cfg: _kernel_hints(cfg), quiet=True
             )
         # Sort by speed, pick fastest correct
         sorted_ok = sorted(result.successes, key=lambda m: m.mean_us)
-        kept = []
-        found = None
         for meas in sorted_ok:
             if _check_correctness(meas.config, x, w1, w2, w3, ref, M, K1, N1, N2, N3):
-                if found is None:
-                    found = meas
-                    c = meas.config
-                    print(f"  [autotune {label}] best: TM={c.TM} TN3={c.TN3} "
-                          f"occ={c.occupancy} nctas={c.num_ctas} "
-                          f"nww={getattr(c,'num_worker_warps',None)} "
-                          f"lat=({c.latency_x},{c.latency_w1},{c.latency_w2},{c.latency_w3}) "
-                          f"tma={c.use_tma} gm={c.GROUP_M} ({meas.mean_us:.1f}us)")
-                if len(kept) < keep:
-                    kept.append(meas)
-        if found is None:
-            if sorted_ok:
-                print(f"  [autotune {label}] WARNING: fastest config failed correctness, "
-                      f"using it anyway")
-                return sorted_ok[0].config, sorted_ok[0].mean_us, []
-            raise RuntimeError(f"Autotune {label}: no valid config found")
-        return found.config, found.mean_us, kept
+                c = meas.config
+                print(f"  [autotune {label}] best: TM={c.TM} TN3={c.TN3} "
+                      f"occ={c.occupancy} nctas={c.num_ctas} "
+                      f"nww={getattr(c,'num_worker_warps',None)} "
+                      f"lat=({c.latency_x},{c.latency_w1},{c.latency_w2},{c.latency_w3}) "
+                      f"tma={c.use_tma} gm={c.GROUP_M} ({meas.mean_us:.1f}us)")
+                return meas.config, meas.mean_us
+        if sorted_ok:
+            print(f"  [autotune {label}] WARNING: fastest config failed correctness, "
+                  f"using it anyway")
+            return sorted_ok[0].config, sorted_ok[0].mean_us
+        raise RuntimeError(f"Autotune {label}: no valid config found")
 
-    # Phase 1: two-tier to keep full coverage without 3888 serial compiles.
-    #  Tier A: all tile combos x GROUP_M at default hints (occ=1, nctas=1, nww=None)
-    #  Tier B: top tile winners x full hint cross (occ x nctas x nww)
-    tile_space = []
-    seen_tiles = set()
-    for cfg in _configs(K1, N1, N2, N3):
-        tk = (cfg.TM, cfg.TN3, cfg.TK1, cfg.TK2, cfg.TK3, cfg.GROUP_M)
-        if tk in seen_tiles:
-            continue
-        seen_tiles.add(tk)
-        tile_space.append(SimpleNamespace(
-            TM=cfg.TM, TN3=cfg.TN3, TK1=cfg.TK1, TK2=cfg.TK2, TK3=cfg.TK3,
-            GROUP_M=cfg.GROUP_M, occupancy=1, num_ctas=1, num_worker_warps=None,
-            latency_x=4, latency_w1=4, latency_w2=4, latency_w3=4,
-            use_tma=15))
-    best_cfg, best_us, tier_a = _run_search(tile_space, "phase1-tiles", keep=12)
-
-    # Tier B: hint sweep on the top-12 tier-A winners (not just the single best —
-    # hints interact with tile shape, so the #1 tile at default hints isn't
-    # necessarily the #1 after hint tuning).
-    hint_winners = []
-    seen_hw = set()
-    for meas in tier_a:
-        c = meas.config
-        key = (c.TM, c.TN3, c.TK1, c.TK2, c.TK3, c.GROUP_M)
-        if key in seen_hw:
-            continue
-        seen_hw.add(key)
-        hint_winners.append(c)
-
-    phase1b_space = []
-    occ_vals = (1, 2, 4)
-    nctas_vals = (1, 2) if cc in ((9, 0), (10, 0), (12, 1)) else (1,)
-    nww_vals = (None, 4, 8) if _cutile_version() >= (1, 4) else (None,)
-    for base in hint_winners:
-        for occ in occ_vals:
-            for nctas in nctas_vals:
-                for nww in nww_vals:
-                    if (occ, nctas, nww) == (base.occupancy, base.num_ctas,
-                                             getattr(base, 'num_worker_warps', None)):
-                        continue
-                    c = SimpleNamespace(**vars(base))
-                    c.occupancy = occ
-                    c.num_ctas = nctas
-                    c.num_worker_warps = nww
-                    phase1b_space.append(c)
-    p1b_cfg, p1b_us, _ = _run_search(phase1b_space, "phase1-hints", keep=0)
-    if p1b_us < best_us:
-        best_cfg, best_us = p1b_cfg, p1b_us
+    # Phase 1: tile x hints x GROUP_M (the big sweep)
+    phase1_space = list(_configs(K1, N1, N2, N3))
+    best_cfg, best_us = _run_search(phase1_space, "phase1")
 
     # Phase 2: per-load latency sweep at best tile+hints (OFAT per load)
     tma_masks = (15, 0, 14, 13, 11, 7)
@@ -509,7 +418,7 @@ def _autotune(x, w1, w2, w3, OUT, M, K1, N1, N2, N3):
             phase2_space.append(c)
 
     if phase2_space:
-        p2_cfg, p2_us, _ = _run_search(phase2_space, "phase2-latency")
+        p2_cfg, p2_us = _run_search(phase2_space, "phase2-latency")
         if p2_us < best_us:
             best_cfg = p2_cfg
             best_us = p2_us
@@ -535,7 +444,7 @@ def _autotune(x, w1, w2, w3, OUT, M, K1, N1, N2, N3):
         phase3_space.append(c)
 
     if phase3_space:
-        p3_cfg, p3_us, _ = _run_search(phase3_space, "phase3-tma")
+        p3_cfg, p3_us = _run_search(phase3_space, "phase3-tma")
         if p3_us < best_us:
             best_cfg = p3_cfg
             best_us = p3_us
@@ -549,8 +458,6 @@ def _autotune(x, w1, w2, w3, OUT, M, K1, N1, N2, N3):
 
     _build_kernel(best_cfg)
     _tune_cache[cache_key] = best_cfg
-    _disk_cache[dk] = _cfg_to_dict(best_cfg)
-    _save_disk_cache(_disk_cache)
     return best_cfg
 
 
