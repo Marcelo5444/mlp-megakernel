@@ -146,26 +146,25 @@ M=8192 (25.4us Triton vs 29.8us cuTile) remains the one losing shape.
 
 #### NVIDIA RTX 4090 (sm_89, 128 SMs) — CUDA 13.4, cuTile 1.7
 
-Shape-dependent heuristic autotune (`MLP_FAST_AUTOTUNE=1`), D=H=OUT=128, FP16, FP32 accumulation.
-The heuristic encodes findings from exhaustive 3-phase autotune (648 configs/shape, ~3-4h per shape):
-TK1=32+lat=1 for M=4096, nww=8 for M≥2048, GROUP_M=1 for M≥16384.
-CUDA event timing, 20 warmup + scaled iterations, median reported in microseconds.
+Full exhaustive autotune (3-phase, 648 configs/shape, ~4h per shape on RTX 4090).
+D=H=OUT=128, FP16, FP32 accumulation.
+CUDA event timing, 20 warmup + 50 iterations, median reported in microseconds.
 
-| M (batch) | PyTorch (us) | Triton (us) | cuTile (us) | torch.compile (us) | vs Triton | vs PyTorch | C vs T |
-|------------|--------------|-------------|-------------|--------------------|-----------|------------|--------|
-| 256 | 38.5 | 38.3 | 22.3 | 100.7 | 1.01x | 1.73x | 1.72x |
-| 512 | 38.8 | 37.7 | 22.6 | 102.8 | 1.03x | 1.71x | 1.67x |
-| 1024 | 39.4 | 38.2 | 22.5 | 103.1 | 1.03x | 1.75x | 1.70x |
-| 2048 | 38.6 | 37.8 | 22.0 | 150.6 | 1.02x | 1.76x | 1.72x |
-| 4096 | 39.1 | 41.3 | 23.3 | 95.4 | 0.95x | 1.68x | 1.77x |
-| 8192 | 37.7 | 36.6 | 21.6 | 96.9 | 1.03x | 1.74x | 1.69x |
-| 16384 | 36.0 | 37.5 | 23.0 | 95.2 | 0.96x | 1.56x | 1.63x |
-| 32768 | 54.9 | 60.8 | 38.7 | 97.2 | 0.90x | 1.42x | 1.57x |
-| 65536 | 91.0 | 75.8 | 69.6 | 106.3 | 1.20x | 1.31x | 1.09x |
+| M (batch) | PyTorch (us) | Triton (us) | cuTile (us) | vs Triton | vs PyTorch | C vs T |
+|------------|--------------|-------------|-------------|-----------|------------|--------|
+| 64 | 6.1 | 5.9 | 5.9 | 1.02x | 1.03x | 1.00x |
+| 512 | 13.3 | 10.5 | 10.4 | 1.01x | 1.28x | 1.01x |
+| 1024 | 14.3 | 11.3 | 11.0 | 1.03x | 1.31x | 1.03x |
+| 2048 | 15.4 | 11.3 | 11.3 | 1.00x | 1.36x | 1.00x |
+| 4096 | 19.5 | 11.3 | 11.3 | 1.00x | 1.73x | 1.00x |
+| 8192 | 25.4 | 14.4 | 15.0 | 0.96x | 1.69x | 0.96x |
+| 16384 | 34.8 | 23.6 | 26.5 | 0.89x | 1.31x | 0.89x |
+| 32768 | 53.2 | 41.0 | 44.0 | 0.93x | 1.21x | 0.93x |
+| 65536 | 90.1 | 74.6 | 78.8 | 0.95x | 1.14x | 0.95x |
 
-cuTile wins at every size. At small M (≤256) the kernel is launch-overhead bound and all implementations are close. At M=128-8192 cuTile achieves 1.6-1.8x over PyTorch. At large M (≥16384) the advantage narrows but cuTile still wins (1.1-1.4x vs PyTorch, 1.1-1.2x vs Triton). The shape-dependent heuristic picks TM=16 TN3=64 occ=2 nww=None gm=1 for M≤256, TM=16 TN3=128 occ=2 nww=4 gm=1 for M=1024, TM=32 TN3=128 occ=2 nww=4 gm=1 for M=4096, and TM=64 TN3=128 occ=4 nww=8 gm=1 for M≥8192.
+cuTile ties or beats Triton at small M, Triton wins at medium M (8192-16384) due to better GROUP_M swizzle, cuTile recovers at large M (65536) with higher occupancy. Best configs per shape cached in `.cutile_tune_cache.json`.
 
-**Note**: torch.compile (`mode="max-autotune"`) is significantly slower (95-150μs) due to compilation overhead and lack of kernel fusion across the 3 matmuls + softplus operations. The fast heuristic autotune results above encode the key findings from exhaustive 3-phase autotune (648 configs/shape, ~3-4h per shape on RTX 4090): TK1=32+lat=1 for M=4096, nww=8 for M≥2048, GROUP_M=1 for M≥16384. To run full exhaustive autotune, use `MLP_FAST_AUTOTUNE=0 python3 profile.py --full-autotune --sizes 1024` (expect ~3-4h per shape).
+**Note**: Full exhaustive autotune (3-phase, 648 configs/shape, ~4h per shape on RTX 4090) encodes findings from ablation study: TK1=32+lat=1 for M=4096, nww=8 for M≥2048, GROUP_M=1 for M≥16384. To run full exhaustive autotune, use `MLP_FAST_AUTOTUNE=0 python3 profile.py --full-autotune --sizes 1024` (expect ~4h per shape).
 
 ### Running the benchmark
 
