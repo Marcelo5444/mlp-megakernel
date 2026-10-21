@@ -9,7 +9,7 @@ understanding to beat the existing cuTile baseline.
 ## Setup
 
 - **GPU:** NVIDIA RTX 4090 (sm_89, 128 SMs)
-- **Docker:** cuda133-pytorch-amd64 (cuTile 1.4.0, Triton 3.7.1)
+- **Docker:** nvcr.io/nvidia/pytorch:26.09-py3 (CUDA 13.4, cuTile 1.7.0, Triton 3.7.1)
 - **Shapes:** D=H=OUT=128, FP16 with FP32 accumulation
 - **Timing:** CUDA events, 50 warmup + 100 iterations, median reported
 - **Method:** Each optimization tested individually (OFAT), then winners combined

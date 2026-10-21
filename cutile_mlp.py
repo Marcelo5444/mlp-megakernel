@@ -1,5 +1,4 @@
-"""
-cuTile 3-layer fused MLP megakernel — optimized with cached fast-path launcher.
+"""cuTile 3-layer fused MLP megakernel — optimized with cached fast-path launcher.
 
 Architecture: out = softplus(softplus(x @ W1) @ W2) @ W3
 
@@ -23,6 +22,7 @@ import os
 import math
 from types import SimpleNamespace
 import cuda.tile as ct
+from cuda.tile import ByTarget
 from cuda.tile.tune import exhaustive_search
 
 _NUM_SMS = None
@@ -133,7 +133,6 @@ def _cutile_version():
 
 def _kernel_hints(cfg):
     """Map config to cuTile compiler hints (ByTarget for arch portability)."""
-    from cuda.tile import ByTarget
     hints = {
         "num_ctas": ByTarget(
             sm_90=cfg.num_ctas, sm_100=cfg.num_ctas,
@@ -418,7 +417,9 @@ def _autotune(x, w1, w2, w3, OUT, M, K1, N1, N2, N3):
             result = exhaustive_search(
                 space, stream, _grid_fn, fused_mlp_kernel,
                 lambda cfg: _launch_args(cfg, OUT),
-                lambda cfg: _kernel_hints(cfg), quiet=True
+                lambda cfg: _kernel_hints(cfg),
+                quiet=True,
+                flush_l2=True,
             )
         # Sort by speed, pick fastest correct
         sorted_ok = sorted(result.successes, key=lambda m: m.mean_us)
