@@ -106,8 +106,17 @@ def pytorch_fwd(x, w1, w2, w3):
     return h2 @ w3
 
 
-def run_benchmark(sizes, D, H, OUT_F, warmup, iters):
+def run_benchmark(sizes, D, H, OUT_F, warmup, iters, full_autotune=False):
     """Run benchmarks for all sizes and return results."""
+    if full_autotune:
+        import os
+        os.environ["MLP_FAST_AUTOTUNE"] = "0"
+        print("Full exhaustive autotune mode: MLP_FAST_AUTOTUNE=0")
+    else:
+        import os
+        os.environ["MLP_FAST_AUTOTUNE"] = "1"
+        print("Fast heuristic autotune mode: MLP_FAST_AUTOTUNE=1")
+
     print(f"{'='*80}")
     print(f"3-Layer Fused MLP Megakernel: cuTile vs Triton vs PyTorch")
     print(f"Architecture: out = softplus(softplus(x @ W1) @ W2) @ W3")
@@ -234,7 +243,9 @@ if __name__ == "__main__":
     parser.add_argument('--OUT', type=int, default=128, help='Output dimension (default: 128)')
     parser.add_argument('--warmup', type=int, default=50, help='Warmup iterations (default: 50)')
     parser.add_argument('--iters', type=int, default=100, help='Benchmark iterations (default: 100)')
+    parser.add_argument('--full-autotune', action='store_true',
+                        help='Run full 3-phase exhaustive autotune per shape (slow, ~hours)')
     args = parser.parse_args()
 
     sizes = [int(s) for s in args.sizes.split(',')]
-    run_benchmark(sizes, args.D, args.H, args.OUT, args.warmup, args.iters)
+    run_benchmark(sizes, args.D, args.H, args.OUT, args.warmup, args.iters, args.full_autotune)
