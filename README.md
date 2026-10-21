@@ -151,19 +151,19 @@ CUDA event timing, 20 warmup + 50 iterations, median reported.
 
 | M (batch) | cuTile (ms) | Triton (ms) | PyTorch (ms) | vs Triton | vs PyTorch |
 |------------|-------------|-------------|--------------|-----------|------------|
-| 64 | 0.0543 | 0.0562 | 0.0625 | 1.04x | 1.15x |
-| 128 | 0.0379 | 0.0563 | 0.0625 | 1.49x | 1.65x |
-| 256 | 0.0379 | 0.0555 | 0.0611 | 1.46x | 1.61x |
-| 512 | 0.0358 | 0.0563 | 0.0635 | 1.57x | 1.77x |
-| 1024 | 0.0369 | 0.0565 | 0.0625 | 1.53x | 1.69x |
-| 2048 | 0.0336 | 0.0532 | 0.0597 | 1.58x | 1.78x |
-| 4096 | 0.0366 | 0.0573 | 0.0604 | 1.57x | 1.65x |
-| 8192 | 0.0369 | 0.0553 | 0.0594 | 1.50x | 1.61x |
-| 16384 | 0.0451 | 0.0587 | 0.0562 | 1.30x | 1.25x |
-| 32768 | 0.0603 | 0.0791 | 0.0663 | 1.31x | 1.10x |
-| 65536 | 0.0911 | 0.1116 | 0.1034 | 1.23x | 1.13x |
+| 64 | 0.035 | 0.055 | 0.061 | 1.57x | 1.74x |
+| 128 | 0.036 | 0.055 | 0.061 | 1.52x | 1.69x |
+| 256 | 0.035 | 0.056 | 0.061 | 1.60x | 1.74x |
+| 512 | 0.035 | 0.056 | 0.064 | 1.60x | 1.83x |
+| 1024 | 0.036 | 0.057 | 0.063 | 1.58x | 1.75x |
+| 2048 | 0.033 | 0.053 | 0.060 | 1.61x | 1.82x |
+| 4096 | 0.035 | 0.057 | 0.061 | 1.63x | 1.74x |
+| 8192 | 0.036 | 0.056 | 0.059 | 1.55x | 1.64x |
+| 16384 | 0.045 | 0.059 | 0.055 | 1.31x | 1.22x |
+| 32768 | 0.060 | 0.079 | 0.066 | 1.32x | 1.09x |
+| 65536 | 0.092 | 0.113 | 0.103 | 1.23x | 1.11x |
 
-cuTile wins at every size. At small M (<=256) the kernel is launch-overhead bound and all implementations are close. At M=128-8192 cuTile achieves 1.5-1.6x over Triton and 1.6-1.8x over PyTorch. At large M (>=16384) the advantage narrows but cuTile still wins (1.1-1.3x vs Triton, 1.1-1.3x vs PyTorch). The shape-dependent heuristic picks TM=16 TN3=64 occ=2 nww=None gm=1 for M<=256, TM=16 TN3=128 occ=2 nww=4 gm=1 for M=1024, TM=32 TN3=128 occ=2 nww=4 gm=1 for M=4096, and TM=64 TN3=128 occ=4 nww=8 gm=1 for M>=8192.
+cuTile wins at every size. At small M (<=256) the kernel is launch-overhead bound and all implementations are close. At M=128-8192 cuTile achieves 1.5-1.7x over Triton and 1.7-1.9x over PyTorch. At large M (>=16384) the advantage narrows but cuTile still wins (1.1-1.3x vs Triton, 1.1-1.2x vs PyTorch). The shape-dependent heuristic picks TM=16 TN3=64 occ=2 nww=None gm=1 for M<=256, TM=16 TN3=128 occ=2 nww=4 gm=1 for M=1024, TM=32 TN3=128 occ=2 nww=4 gm=1 for M=4096, and TM=64 TN3=128 occ=4 nww=8 gm=1 for M>=8192.
 
 ### Optimizations
 
