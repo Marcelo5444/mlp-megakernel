@@ -95,45 +95,47 @@ lower occupancy or different GROUP_M due to fp32 store traffic).
 
 ### Benchmark: cuTile vs Triton vs PyTorch (DGX Spark / GB10)
 
-NVIDIA GB10 (sm_121, 48 SMs), D=H=OUT=128, FP16, FP32 accumulation.
-`do_bench` with L2 flush, warmup=25, rep=100 for forward; warmup=10, rep=50
-for forward+backward. Fresh exhaustive autotune per shape.
+NVIDIA GB10 (sm_121, 48 SMs), CUDA 13.4, cuTile 1.7, torch 2.14.1+cu130.
+D=H=OUT=128, FP16, FP32 accumulation. `do_bench` with L2 flush, warmup=25,
+rep=100 for forward; warmup=10, rep=50 for forward+backward. Fresh exhaustive
+autotune per shape (empty cache), split-K backward kernels.
 
 #### Forward pass (cut-inf = inference, cut-train = training with act storage)
 
 | M | PyTorch (us) | torch.compile (us) | Triton (us) | cut-inf (us) | cut-train (us) | vs PyTorch | vs Triton |
 |---|---|---|---|---|---|---|---|
-| 256 | 16.7 | 18.5 | 10.0 | **9.2** | 11.0 | 1.80x | 1.09x |
-| 512 | 21.1 | 22.0 | 11.5 | **11.0** | 12.3 | 1.91x | 1.05x |
-| 1024 | 26.6 | 25.4 | 16.0 | **12.6** | 16.4 | 2.11x | 1.27x |
-| 2048 | 33.7 | 33.3 | 20.2 | **17.8** | 23.6 | 1.89x | 1.13x |
-| 4096 | 53.0 | 52.6 | 30.5 | **23.5** | 40.4 | 2.26x | 1.30x |
-| 8192 | 89.7 | 92.5 | 44.9 | **39.1** | 76.7 | 2.30x | 1.15x |
-| 16384 | 147.7 | 136.2 | 77.4 | **63.1** | 133.1 | 2.34x | 1.23x |
-| 32768 | 285.2 | 241.3 | 134.3 | **109.4** | 251.9 | 2.61x | 1.23x |
-| 65536 | 661.3 | 600.1 | 227.4 | **190.9** | 483.4 | 3.46x | 1.19x |
+| 256 | 16.2 | 17.2 | 10.3 | **8.2** | 8.2 | 1.98x | 1.26x |
+| 512 | 23.8 | 21.3 | 12.6 | **8.5** | 9.9 | 2.80x | 1.48x |
+| 1024 | 24.2 | 21.4 | 16.0 | **12.2** | 14.5 | 1.98x | 1.31x |
+| 2048 | 35.1 | 31.4 | 20.7 | **16.2** | 18.4 | 2.16x | 1.28x |
+| 4096 | 53.2 | 50.8 | 29.9 | **23.9** | 31.7 | 2.22x | 1.25x |
+| 8192 | 84.1 | 83.4 | 42.4 | **39.0** | 53.2 | 2.16x | 1.09x |
+| 16384 | 141.1 | 130.1 | 78.2 | **60.1** | 94.6 | 2.35x | 1.30x |
+| 32768 | 271.4 | 238.0 | 126.0 | **103.7** | 170.7 | 2.62x | 1.21x |
+| 65536 | 571.2 | 545.7 | 227.9 | **178.1** | 323.4 | 3.21x | 1.28x |
 
-cut-inf beats PyTorch at every shape (1.8–3.5x) and beats Triton at every
-shape (1.05–1.30x). cut-train costs 1.1–2.6x cut-inf (fp32 activation
+cut-inf beats PyTorch at every shape (2.0–3.2x) and beats Triton at every
+shape (1.09–1.48x). cut-train costs 1.0–1.8x cut-inf (fp16 activation
 storage overhead).
 
 #### Forward + Backward pass
 
 | M | PyTorch (us) | torch.compile (us) | cutile (us) | vs PyTorch | vs T.compile |
 |---|---|---|---|---|---|
-| 256 | 43.9 | 37.7 | **98.2** | 0.45x | 1.16x |
-| 512 | 51.7 | 53.3 | **166.4** | 0.31x | 0.97x |
-| 1024 | 75.8 | 68.1 | **177.7** | 0.43x | 1.11x |
-| 2048 | 98.1 | 88.5 | **314.1** | 0.31x | 1.11x |
-| 4096 | 144.5 | 126.2 | **246.6** | 0.59x | 1.15x |
-| 8192 | 212.2 | 206.7 | **348.5** | 0.61x | 1.03x |
-| 16384 | 441.6 | 408.0 | **564.9** | 0.78x | 1.08x |
-| 32768 | 881.2 | 814.0 | **1040.5** | 0.85x | 1.08x |
-| 65536 | 2023.9 | 1902.2 | **1989.5** | **1.02x** | 1.06x |
+| 256 | 68.5 | 60.9 | **66.3** | 1.03x | 0.92x |
+| 512 | 88.4 | 52.0 | **84.4** | 1.05x | 0.62x |
+| 1024 | 85.1 | 74.5 | **135.7** | 0.63x | 0.55x |
+| 2048 | 99.3 | 95.2 | **221.0** | 0.45x | 0.43x |
+| 4096 | 131.6 | 129.1 | **234.3** | 0.56x | 0.55x |
+| 8192 | 214.3 | 204.2 | **298.7** | 0.72x | 0.68x |
+| 16384 | 450.7 | 369.2 | **468.5** | 0.96x | 0.79x |
+| 32768 | 887.3 | 826.0 | **866.4** | 1.02x | 0.95x |
+| 65536 | 2028.6 | 1893.3 | **1586.8** | **1.28x** | **1.19x** |
 
-cuTile fwd+bwd **beats PyTorch eager at M=65536** (1.02x) and beats
-torch.compile at all shapes except 256/512. The gap narrows with M as the
-fused kernel amortizes launch overhead and activation storage costs.
+With the split-K backward, cuTile fwd+bwd **beats PyTorch eager at M=65536
+by 1.28x** (was 1.02x with the fused backward) and also beats torch.compile
+there (1.19x). Small/mid M still favor cuBLAS-based eager — the backward
+pays activation re-reads and wgrad reduction that only amortize at large M.
 
 #### Backward only (isolated backward pass)
 
@@ -141,22 +143,22 @@ Backward-only comparison: PyTorch manual chain rule (no autograd overhead)
 vs torch.compile'd chain rule vs direct `fused_mlp_bwd_cutile` kernel call
 with stored fp32 activations. `do_bench` with L2 flush, warmup=10, rep=50.
 
-| M | PyTorch manual (us) | torch.compile (us) | cuTile fused (us) | vs PyTorch | vs T.compile |
+| M | PyTorch manual (us) | torch.compile (us) | cuTile split-K (us) | vs PyTorch | vs T.compile |
 |---|---|---|---|---|---|
-| 256 | 35.9 | 24.6 | **91.3** | 0.39x | 1.46x |
-| 512 | 42.6 | 35.9 | **155.6** | 0.27x | 1.19x |
-| 1024 | 57.3 | 52.8 | **160.9** | 0.36x | 1.08x |
-| 2048 | 79.3 | 72.2 | **280.0** | 0.28x | 1.10x |
-| 4096 | 118.0 | 101.5 | **210.4** | 0.56x | 1.16x |
-| 8192 | 183.4 | 150.6 | **272.6** | 0.67x | 1.22x |
-| 16384 | 370.5 | 231.1 | **415.3** | 0.89x | 1.60x |
-| 32768 | 744.8 | 505.8 | **782.6** | 0.95x | 1.47x |
-| 65536 | 1611.9 | 1230.3 | **1419.0** | **1.14x** | 1.31x |
+| 256 | 33.0 | 27.6 | **94.6** | 0.35x | 0.29x |
+| 512 | 39.9 | 35.4 | **155.3** | 0.26x | 0.23x |
+| 1024 | 59.0 | 55.8 | **165.2** | 0.36x | 0.34x |
+| 2048 | 87.7 | 73.8 | **291.7** | 0.30x | 0.25x |
+| 4096 | 118.8 | 107.1 | **209.9** | 0.57x | 0.51x |
+| 8192 | 180.7 | 152.3 | **274.5** | 0.66x | 0.55x |
+| 16384 | 366.4 | 228.8 | **412.3** | 0.89x | 0.55x |
+| 32768 | 741.9 | 495.9 | **749.9** | 0.99x | 0.66x |
+| 65536 | 1625.3 | 1237.5 | **1423.7** | **1.14x** | 0.87x |
 
-The fused cuTile backward **beats PyTorch manual backward at M=65536**
-(1.14x) and reaches near-parity at M=32768 (0.95x). The gap narrows with M
-as the fused kernel amortizes launch overhead and the 5 chained MMAs
-dominate over PyTorch's ~6 separate GEMM+activation ops.
+The cuTile split-K backward **beats PyTorch manual backward at M=65536**
+(1.14x) and reaches near-parity at M=32768 (0.99x). Small M is dominated by
+the 3-kernel launch sequence (dgrad + wgrad split-K + reduce) vs PyTorch's
+single autograd engine dispatch.
 
 ### Benchmark: cuTile vs Triton vs PyTorch (RTX 4090)
 
