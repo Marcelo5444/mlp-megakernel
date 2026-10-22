@@ -27,6 +27,17 @@ from cuda.tile.tune import exhaustive_search
 
 _NUM_SMS = None
 _BWD_FUSED_K8 = None  # cached nww=8/occ=1 variant of bwd_fused_kernel
+_BWD_FUSED_VARIANTS = {}  # (occ, nww, nctas) -> replace_hints'd kernel
+
+# Tuned backward configs (GB10 sm_121, exhaustive_search per M; see tune_bwd_hints.py)
+_BWD_TUNED = {
+    256:   (16, 1, 8, 2),   # (TM, occ, nww, nctas) — 86us, cos=1.0
+    1024:  (64, 2, 8, 2),   # 161us, cos=1.0
+    4096:  (16, 4, 8, 1),   # 209us, cos=1.0
+    16384: (16, 1, 8, 1),   # 429us, cos=1.0
+    65536: (16, 4, 8, 1),   # 1184us, cos=1.0
+}
+_BWD_BUCKETS = sorted(_BWD_TUNED.keys())
 
 
 def _get_num_sms():
@@ -1181,17 +1192,39 @@ def fused_mlp_bwd_cutile(dout, x, w1, w2, w3, H0=None, H1PRE=None):
     stream = torch.cuda.current_stream()
     num_sms = _get_num_sms()
 
-    TM = 16 if M >= 16 else _next_pow2(M)  # TM=16 wins across M on GB10
+    # Tuned per-M backward config (GB10 exhaustive_search). Pick nearest bucket
+    # at or below M; fall back to the smallest for smaller, the largest for
+    # bigger. Untested dims fall through to TM=16/occ=1/nww=8 (the old default).
+    if K1 == N1 == N2 == N3 == 128:
+        bucket = _BWD_BUCKETS[0]
+        for b in _BWD_BUCKETS:
+            if M >= b:
+                bucket = b
+        TM, occ, nww, nctas = _BWD_TUNED[bucket]
+        if M < 16:
+            TM = min(TM, _next_pow2(M))
+    else:
+        TM, occ, nww, nctas = 16, 1, 8, 1
+        if M < 16:
+            TM = _next_pow2(M)
     TN = K1  # single square tile per weight (dims 128 in this repo)
     TK1 = TN
     grid = (min(num_sms, (M + TM - 1) // TM),)
 
-    # nww=8 + occ=1: 2-3x faster than default hints on GB10 (sweep in tune2.py)
-    global _BWD_FUSED_K8
-    if _BWD_FUSED_K8 is None:
-        _BWD_FUSED_K8 = bwd_fused_kernel.replace_hints(occupancy=1,
-                                                       num_worker_warps=8)
-    kernel = _BWD_FUSED_K8
+    key = (occ, nww, nctas)
+    kernel = _BWD_FUSED_VARIANTS.get(key)
+    if kernel is None:
+        hints = {
+            "occupancy": occ,
+            "num_ctas": ByTarget(
+                sm_90=nctas, sm_100=nctas, sm_120=nctas,
+                sm_121=nctas, sm_89=nctas,
+            ),
+        }
+        if nww is not None:
+            hints["num_worker_warps"] = nww
+        kernel = bwd_fused_kernel.replace_hints(**hints)
+        _BWD_FUSED_VARIANTS[key] = kernel
 
     # ONE launch: dh1, dh2, dx, dW1, dW2, dW3
     ct.launch(stream, grid, kernel, (
