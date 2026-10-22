@@ -135,6 +135,29 @@ cuTile fwd+bwd **beats PyTorch eager at M=65536** (1.02x) and beats
 torch.compile at all shapes except 256/512. The gap narrows with M as the
 fused kernel amortizes launch overhead and activation storage costs.
 
+#### Backward only (isolated backward pass)
+
+Backward-only comparison: PyTorch manual chain rule (no autograd overhead)
+vs torch.compile'd chain rule vs direct `fused_mlp_bwd_cutile` kernel call
+with stored fp32 activations. `do_bench` with L2 flush, warmup=10, rep=50.
+
+| M | PyTorch manual (us) | torch.compile (us) | cuTile fused (us) | vs PyTorch | vs T.compile |
+|---|---|---|---|---|---|
+| 256 | 35.9 | 24.6 | **91.3** | 0.39x | 1.46x |
+| 512 | 42.6 | 35.9 | **155.6** | 0.27x | 1.19x |
+| 1024 | 57.3 | 52.8 | **160.9** | 0.36x | 1.08x |
+| 2048 | 79.3 | 72.2 | **280.0** | 0.28x | 1.10x |
+| 4096 | 118.0 | 101.5 | **210.4** | 0.56x | 1.16x |
+| 8192 | 183.4 | 150.6 | **272.6** | 0.67x | 1.22x |
+| 16384 | 370.5 | 231.1 | **415.3** | 0.89x | 1.60x |
+| 32768 | 744.8 | 505.8 | **782.6** | 0.95x | 1.47x |
+| 65536 | 1611.9 | 1230.3 | **1419.0** | **1.14x** | 1.31x |
+
+The fused cuTile backward **beats PyTorch manual backward at M=65536**
+(1.14x) and reaches near-parity at M=32768 (0.95x). The gap narrows with M
+as the fused kernel amortizes launch overhead and the 5 chained MMAs
+dominate over PyTorch's ~6 separate GEMM+activation ops.
+
 #### Train vs Inference autotune config comparison
 
 | M | cut-inf config | cut-train config | Same? |
