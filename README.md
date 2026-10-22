@@ -193,24 +193,23 @@ dim across 128 blocks) with a deterministic tiled reduction — no atomics, no
 register-resident-across-kernel accumulators. Activations are stored fp16
 and the wgrad A-operand is recomputed as sigmoid(pre)*softplus(pre).
 do_bench L2-flushed, warmup=10, rep=50, bwd-only path (stored acts,
-random dout); eager = PyTorch fwd+bwd.
+random dout).
 
-| M | old fused bwd (us) | split-K bwd (us) | PyTorch eager fwd+bwd (us) | speedup vs old | vs eager |
-|---|---|---|---|---|---|
-| 256 | 84.1 | **36.1** | 44.2 | 2.3x | 1.22x |
-| 512 | 90.2 | **36.0** | 48.7 | 2.5x | 1.35x |
-| 1024 | 141.0 | **54.5** | 54.4 | 2.6x | 1.00x |
-| 2048 | 153.9 | **89.9** | 58.5 | 1.7x | 0.65x* |
-| 4096 | 157.4 | **115.9** | 70.8 | 1.4x | 0.61x* |
-| 8192 | 177.1 | **134.0** | 82.1 | 1.3x | 0.61x* |
-| 16384 | 215.3 | **167.7** | 119.3 | 1.3x | 0.71x* |
-| 32768 | 291.9 | **226.9** | 169.2 | 1.3x | 0.75x* |
-| 65536 | 436.0 | **359.9** | 369.8 | 1.2x | 1.03x |
+| M | old fused bwd (us) | split-K bwd (us) | speedup |
+|---|---|---|---|
+| 256 | 84.1 | **36.1** | 2.3x |
+| 512 | 90.2 | **36.0** | 2.5x |
+| 1024 | 141.0 | **54.5** | 2.6x |
+| 2048 | 153.9 | **89.9** | 1.7x |
+| 4096 | 157.4 | **115.9** | 1.4x |
+| 8192 | 177.1 | **134.0** | 1.3x |
+| 16384 | 215.3 | **167.7** | 1.3x |
+| 32768 | 291.9 | **226.9** | 1.3x |
+| 65536 | 436.0 | **359.9** | 1.2x |
 
-* eager fwd+bwd includes the forward pass; the cuTile bwd column is
-backward-only. Correctness gate (cosine >= 0.99 vs eager, all of
-dx/dW1/dW2/dW3) passes at every M; the old fused bwd failed it at M=65536.
-dW3 cosine is 0.997 (fp16 pre-activation recompute); all others are 1.0.
+Correctness gate (cosine >= 0.99 vs eager, all of dx/dW1/dW2/dW3) passes at
+every M; the old fused bwd failed it at M=65536. dW3 cosine is 0.997 (fp16
+pre-activation recompute); all others are 1.0.
 
 #### Train vs Inference autotune config comparison
 
