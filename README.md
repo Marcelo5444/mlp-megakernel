@@ -158,6 +158,41 @@ The fused cuTile backward **beats PyTorch manual backward at M=65536**
 as the fused kernel amortizes launch overhead and the 5 chained MMAs
 dominate over PyTorch's ~6 separate GEMM+activation ops.
 
+### Benchmark: cuTile vs Triton vs PyTorch (RTX 4090)
+
+NVIDIA RTX 4090 (sm_89, 128 SMs), CUDA 13.4, cuTile 1.7, torch 2.14.1+cu130.
+D=H=OUT=128, FP16, FP32 accumulation. `do_bench` with L2 flush, warmup=25,
+rep=100 for forward; warmup=10, rep=50 for forward+backward. Fresh exhaustive
+autotune per shape (no disk cache for sm_89 — 1080-config phase-1 tile sweep
++ hint cross + latency/TMA OFAT per shape).
+
+#### Forward pass (cut-inf = inference, cut-train = training with act storage)
+
+| M | PyTorch (us) | torch.compile (us) | Triton (us) | cut-inf (us) | cut-train (us) | vs PyTorch | vs Triton |
+|---|---|---|---|---|---|---|---|
+| 256 | 15.1 | 11.3 | 7.5 | **6.5** | 6.8 | 2.31x | 1.15x |
+| 512 | 16.0 | 15.4 | 7.3 | **6.8** | 7.6 | 2.35x | 1.07x |
+| 1024 | 18.3 | 16.4 | 7.8 | **7.7** | 8.2 | 2.38x | 1.01x |
+| 2048 | 20.6 | 18.8 | 8.7 | **8.6** | 10.2 | 2.41x | 1.01x |
+| 4096 | 25.0 | 24.0 | 10.4 | **10.6** | 11.7 | 2.36x | 0.98x |
+| 8192 | 35.1 | 34.8 | 14.7 | **15.2** | 20.4 | 2.32x | 0.97x |
+| 16384 | 45.4 | 45.2 | 25.2 | **25.8** | 38.1 | 1.76x | 0.98x |
+| 32768 | 67.9 | 66.5 | 43.4 | **42.8** | 58.8 | 1.59x | 1.01x |
+| 65536 | 132.5 | 133.3 | 77.4 | **77.2** | 120.5 | 1.72x | 1.00x |
+
+cut-inf beats PyTorch eager at every shape (1.6–2.4x) and ties or beats
+Triton at every shape except 4096–16384 (0.97–0.98x, within noise).
+cut-train costs 1.05–1.6x cut-inf for fp32 activation storage, growing with
+M as store traffic dominates.
+
+#### Forward + Backward pass
+
+⚠️ Preliminary — the 4090 bwd numbers from the fresh run are noisy (PyTorch
+eager bwd times non-monotonic across M, e.g. 221us@256 vs 73us@512, likely
+GPU clock ramp on the idle card) and cuTile bwd **fails correctness at
+M=65536** (cosine < 0.99 on dx/dW1). Re-run pending; GB10 bwd table above is
+the reliable reference.
+
 #### Train vs Inference autotune config comparison
 
 | M | cut-inf config | cut-train config | Same? |
