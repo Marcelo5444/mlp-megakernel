@@ -134,6 +134,63 @@ for M in Ms:
           + ("" if (ok_dx and ok_dw1) else "  !!CORRECTNESS"))
 
 print()
+print("=== BACKWARD ONLY (do_bench, L2 flushed) ===")
+print(f"{'M':>7} {'pytorch':>10} {'t.compile':>10} {'cutile':>10} {'C spd':>6} {'PC spd':>7}")
+rows_bwd_only = []
+for M in Ms:
+    x = torch.randn(M, D, dtype=torch.float16, device='cuda') * 0.02
+    w1 = torch.randn(D, H, dtype=torch.float16, device='cuda') * 0.02
+    w2 = torch.randn(H, H, dtype=torch.float16, device='cuda') * 0.02
+    w3 = torch.randn(H, N3, dtype=torch.float16, device='cuda') * 0.02
+
+    # Precompute activations for backward (same for all backends)
+    h0 = x @ w1
+    h1 = F.softplus(h0)
+    h1_pre = h1 @ w2
+    h2 = F.softplus(h1_pre)
+    dout = torch.ones(M, N3, dtype=torch.float16, device='cuda')
+
+    # PyTorch backward: manual chain rule (no autograd overhead)
+    def pytorch_bwd_manual():
+        dh2 = dout @ w3.T
+        dh1_pre = dh2 * torch.sigmoid(h1_pre)
+        dh1 = dh1_pre @ w2.T
+        dh0 = dh1 * torch.sigmoid(h0)
+        dx = dh0 @ w1.T
+        dW3 = h2.T @ dout
+        dW2 = h1.T @ dh1_pre
+        dW1 = x.T @ dh0
+        return dx, dW1, dW2, dW3
+
+    # torch.compile backward (compiled chain rule)
+    @torch.compile(fullgraph=True, mode="max-autotune-no-cudagraphs")
+    def pytorch_bwd_compile(dout, x, w1, w2, w3, h0, h1_pre, h2):
+        dh2 = dout @ w3.T
+        dh1_pre = dh2 * torch.sigmoid(h1_pre)
+        dh1 = dh1_pre @ w2.T
+        dh0 = dh1 * torch.sigmoid(h0)
+        dx = dh0 @ w1.T
+        dW3 = h2.T @ dout
+        dW2 = h1.T @ dh1_pre
+        dW1 = x.T @ dh0
+        return dx, dW1, dW2, dW3
+
+    # cuTile backward: direct kernel call with stored activations
+    from cutile_mlp import fused_mlp_bwd_cutile
+    H0_buf = h0.float().contiguous()
+    H1PRE_buf = h1_pre.float().contiguous()
+
+    def cutile_bwd_only():
+        return fused_mlp_bwd_cutile(dout, x, w1, w2, w3, H0_buf, H1PRE_buf)
+
+    t_p = do_bench(pytorch_bwd_manual, warmup=10, rep=50) * 1000
+    t_pc = do_bench(lambda: pytorch_bwd_compile(dout, x, w1, w2, w3, h0, h1_pre, h2), warmup=10, rep=50) * 1000
+    t_c = do_bench(cutile_bwd_only, warmup=10, rep=50) * 1000
+
+    rows_bwd_only.append((M, t_p, t_pc, t_c))
+    print(f"{M:7d} {t_p:9.1f}u {t_pc:9.1f}u {t_c:9.1f}u {t_p/t_c:5.2f}x {t_p/t_pc:6.2f}x")
+
+print()
 print("=== SUMMARY (do_bench, L2 flushed) ===")
 print(f"{'M':>7} {'pytorch':>10} {'t.compile':>10} {'cutile':>10} {'C spd':>6} {'PC spd':>7}")
 for M, tp, tpc, tc, ok in rows_bwd:
