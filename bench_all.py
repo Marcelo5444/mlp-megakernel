@@ -1,62 +1,132 @@
-"""Benchmark: PyTorch eager vs Triton megakernel vs cuTile (full autotune), across M shapes."""
-import os, sys, time
+"""Benchmark: PyTorch eager vs torch.compile vs Triton vs cuTile (fwd + bwd).
+
+Uses triton.testing.do_bench with L2 flush for stable, skill-aligned timing.
+Compares: torch eager, torch.compile (max-autotune-no-cudagraphs), Triton, cuTile.
+"""
+import os
+import sys
 os.environ.pop("MLP_FAST_AUTOTUNE", None)  # force full exhaustive autotune
-sys.path.insert(0, "/home/marcelo/mlp-megakernel")
+sys.path.insert(0, "/work")
 import torch
 import torch.nn.functional as F
+from triton.testing import do_bench
 
 torch.manual_seed(0)
 D, H, N3 = 128, 128, 128
 
-def bench(fn, iters=100, warmup=20):
-    for _ in range(warmup):
-        fn()
-    torch.cuda.synchronize()
-    s = torch.cuda.Event(enable_timing=True)
-    e = torch.cuda.Event(enable_timing=True)
-    s.record()
-    for _ in range(iters):
-        fn()
-    e.record()
-    torch.cuda.synchronize()
-    return s.elapsed_time(e) * 1000 / iters  # us
 
-def pytorch_ref(x, w1, w2, w3):
+def pytorch_fwd_ref(x, w1, w2, w3):
     return F.softplus(F.softplus(x @ w1) @ w2) @ w3
 
+
+# torch.compile is applied lazily inside the benchmark loop to avoid
+# graph-breaking the eager reference backward used for correctness checks.
+_pytorch_fwd_compile = None
+
+def pytorch_fwd_compile(x, w1, w2, w3):
+    global _pytorch_fwd_compile
+    if _pytorch_fwd_compile is None:
+        _pytorch_fwd_compile = torch.compile(
+            pytorch_fwd_ref, fullgraph=True, mode="max-autotune-no-cudagraphs"
+        )
+    return _pytorch_fwd_compile(x, w1, w2, w3)
+
+
 from kernel import ModelNew as TritonMLP
-from cutile_mlp import fused_mlp_fwd_cutile
+from cutile_mlp import fused_mlp_fwd_cutile, fused_mlp_cutile
 
 triton_model = TritonMLP()
 
 Ms = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
-rows = []
+
+print("=== FORWARD PASS (do_bench, L2 flushed) ===")
+print(f"{'M':>7} {'pytorch':>10} {'t.compile':>10} {'triton':>10} {'cutile':>10} {'T spd':>6} {'C spd':>6} {'PC spd':>7} {'C vs T':>7}")
+rows_fwd = []
 for M in Ms:
     x = torch.randn(M, D, dtype=torch.float16, device='cuda') * 0.02
     w1 = torch.randn(D, H, dtype=torch.float16, device='cuda') * 0.02
     w2 = torch.randn(H, H, dtype=torch.float16, device='cuda') * 0.02
     w3 = torch.randn(H, N3, dtype=torch.float16, device='cuda') * 0.02
 
-    ref = pytorch_ref(x, w1, w2, w3)
-
-    # correctness
+    ref = pytorch_fwd_ref(x, w1, w2, w3)
     out_t = triton_model(x, w1, w2, w3)
     out_c = fused_mlp_fwd_cutile(x, w1, w2, w3)
     torch.cuda.synchronize()
     ok_t = torch.allclose(out_t, ref, atol=1e-2, rtol=1e-2)
     ok_c = torch.allclose(out_c, ref, atol=1e-2, rtol=1e-2)
 
-    iters = max(20, min(200, int(2e8 / (M * 128 * 128 * 3))))  # scale down for big M
-    t_p = bench(lambda: pytorch_ref(x, w1, w2, w3), iters=iters)
-    t_t = bench(lambda: triton_model(x, w1, w2, w3), iters=iters)
-    t_c = bench(lambda: fused_mlp_fwd_cutile(x, w1, w2, w3), iters=iters)
+    t_p = do_bench(lambda: pytorch_fwd_ref(x, w1, w2, w3), warmup=25, rep=100) * 1000
+    t_pc = do_bench(lambda: pytorch_fwd_compile(x, w1, w2, w3), warmup=25, rep=100) * 1000
+    t_t = do_bench(lambda: triton_model(x, w1, w2, w3), warmup=25, rep=100) * 1000
+    t_c = do_bench(lambda: fused_mlp_fwd_cutile(x, w1, w2, w3), warmup=25, rep=100) * 1000
 
-    rows.append((M, t_p, t_t, t_c, ok_t, ok_c))
-    print(f"M={M:6d}  pytorch={t_p:8.1f}us  triton={t_t:8.1f}us  cutile={t_c:8.1f}us"
-          f"  triton_speedup={t_p/t_t:.2f}x  cutile_speedup={t_p/t_c:.2f}x  ok={ok_t}/{ok_c}", flush=True)
+    rows_fwd.append((M, t_p, t_pc, t_t, t_c, ok_t, ok_c))
+    print(f"{M:7d} {t_p:9.1f}u {t_pc:9.1f}u {t_t:9.1f}u {t_c:9.1f}u {t_p/t_t:5.2f}x {t_p/t_c:5.2f}x {t_p/t_pc:6.2f}x {t_t/t_c:6.2f}x"
+          + ("" if (ok_t and ok_c) else "  !!CORRECTNESS"))
 
-print("\n=== SUMMARY ===")
-print(f"{'M':>7} {'pytorch':>10} {'triton':>10} {'cutile':>10} {'T spd':>6} {'C spd':>6} {'C vs T':>7}")
-for M, tp, tt, tc, okt, okc in rows:
-    print(f"{M:7d} {tp:9.1f}u {tt:9.1f}u {tc:9.1f}u {tp/tt:5.2f}x {tp/tc:5.2f}x {tt/tc:6.2f}x"
-          + ("" if (okt and okc) else "  !!CORRECTNESS"))
+print()
+print("=== FORWARD + BACKWARD PASS (do_bench, L2 flushed) ===")
+print(f"{'M':>7} {'pytorch':>10} {'t.compile':>10} {'cutile':>10} {'C spd':>6} {'PC spd':>7}")
+rows_bwd = []
+for M in Ms:
+    # Correctness check first, before any torch.compile calls
+    x = torch.randn(M, D, dtype=torch.float16, device='cuda') * 0.02
+    w1 = torch.randn(D, H, dtype=torch.float16, device='cuda') * 0.02
+    w2 = torch.randn(H, H, dtype=torch.float16, device='cuda') * 0.02
+    w3 = torch.randn(H, N3, dtype=torch.float16, device='cuda') * 0.02
+    x.requires_grad_(True)
+    w1.requires_grad_(True)
+    w2.requires_grad_(True)
+    w3.requires_grad_(True)
+
+    # Eager reference backward
+    out_ref = pytorch_fwd_ref(x, w1, w2, w3)
+    out_ref.sum().backward()
+    ref_dx, ref_dw1 = x.grad.clone(), w1.grad.clone()
+
+    # cuTile backward
+    x.grad = None; w1.grad = None; w2.grad = None; w3.grad = None
+    out_ct = fused_mlp_cutile(x, w1, w2, w3)
+    out_ct.sum().backward()
+    ok_dx = F.cosine_similarity(ref_dx.flatten(), x.grad.flatten(), dim=0).item() >= 0.99
+    ok_dw1 = F.cosine_similarity(ref_dw1.flatten(), w1.grad.flatten(), dim=0).item() >= 0.99
+
+    # Now benchmark (fresh tensors to avoid graph pollution)
+    x = torch.randn(M, D, dtype=torch.float16, device='cuda') * 0.02
+    w1 = torch.randn(D, H, dtype=torch.float16, device='cuda') * 0.02
+    w2 = torch.randn(H, H, dtype=torch.float16, device='cuda') * 0.02
+    w3 = torch.randn(H, N3, dtype=torch.float16, device='cuda') * 0.02
+    x.requires_grad_(True)
+    w1.requires_grad_(True)
+    w2.requires_grad_(True)
+    w3.requires_grad_(True)
+
+    def pytorch_fwd_bwd():
+        x.grad = None; w1.grad = None; w2.grad = None; w3.grad = None
+        out = pytorch_fwd_ref(x, w1, w2, w3)
+        out.sum().backward()
+
+    def pytorch_compile_fwd_bwd():
+        x.grad = None; w1.grad = None; w2.grad = None; w3.grad = None
+        out = pytorch_fwd_compile(x, w1, w2, w3)
+        out.sum().backward()
+
+    def cutile_fwd_bwd():
+        x.grad = None; w1.grad = None; w2.grad = None; w3.grad = None
+        out = fused_mlp_cutile(x, w1, w2, w3)
+        out.sum().backward()
+
+    t_p = do_bench(pytorch_fwd_bwd, warmup=10, rep=50) * 1000
+    t_pc = do_bench(pytorch_compile_fwd_bwd, warmup=10, rep=50) * 1000
+    t_c = do_bench(cutile_fwd_bwd, warmup=10, rep=50) * 1000
+
+    rows_bwd.append((M, t_p, t_pc, t_c, ok_dx and ok_dw1))
+    print(f"{M:7d} {t_p:9.1f}u {t_pc:9.1f}u {t_c:9.1f}u {t_p/t_c:5.2f}x {t_p/t_pc:6.2f}x"
+          + ("" if (ok_dx and ok_dw1) else "  !!CORRECTNESS"))
+
+print()
+print("=== SUMMARY (do_bench, L2 flushed) ===")
+print(f"{'M':>7} {'pytorch':>10} {'t.compile':>10} {'cutile':>10} {'C spd':>6} {'PC spd':>7}")
+for M, tp, tpc, tc, ok in rows_bwd:
+    print(f"{M:7d} {tp:9.1f}u {tpc:9.1f}u {tc:9.1f}u {tp/tc:5.2f}x {tp/tpc:6.2f}x"
+          + ("" if ok else "  !!CORRECTNESS"))

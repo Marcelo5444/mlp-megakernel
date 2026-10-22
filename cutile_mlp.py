@@ -232,7 +232,12 @@ _tune_cache: dict = {}
 _kernel_cache: dict = {}
 
 # Persistent disk cache: full autotune runs once per (arch, shape), ever.
-_TUNE_CACHE_PATH = os.path.join("/work", ".cutile_tune_cache.json")
+# Uses repo directory if writable, falls back to /work (Docker).
+_REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+if os.access(_REPO_DIR, os.W_OK):
+    _TUNE_CACHE_PATH = os.path.join(_REPO_DIR, ".cutile_tune_cache.json")
+else:
+    _TUNE_CACHE_PATH = os.path.join("/work", ".cutile_tune_cache.json")
 
 def _load_disk_cache():
     try:
@@ -637,8 +642,267 @@ def fused_mlp_fwd_cutile(x, w1, w2, w3):
     return OUT
 
 
+# ============================================================
+# Backward kernels (fused, atomic weight-grad accumulation)
+# ============================================================
+
+def softplus_grad_tile(x):
+    """sigmoid(x) = where(x > 20, 1, exp(x)/(1+exp(x)))."""
+    ex = ct.exp(x)
+    return ct.where(x > 20.0, 1.0, ex / (1.0 + ex))
+
+
+@ct.kernel
+def bwd_dgrad_kernel(
+    X, W1, W2, W3, DOUT, DH1, DX,
+    M,
+    K1: ct.Constant[int], N1: ct.Constant[int], N2: ct.Constant[int], N3: ct.Constant[int],
+    TM: ct.Constant[int], TK1: ct.Constant[int], TK2: ct.Constant[int], TK3: ct.Constant[int],
+):
+    """Persistent kernel: for each M-tile, compute dh1, dh2, dx."""
+    raw_pid = ct.bid(0)
+    num_pids = ct.num_blocks(0)
+    num_m = ct.cdiv(M, TM)
+
+    for pm in range(raw_pid, num_m, num_pids):
+        # ---- Stage 1: dh1 = (dout @ W3^T) * sigmoid(h1) ----
+        for k2 in range(ct.cdiv(N2, TK2)):
+            dh1_acc = ct.zeros((TM, TK2), ct.float32)
+            h1_acc = ct.zeros((TM, TK2), ct.float32)
+            for k1 in range(ct.cdiv(K1, TK1)):
+                x_t = ct.load(X, (pm, k1), shape=(TM, TK1), latency=4)
+                w1_t = ct.load(W1, (k1, k2), shape=(TK1, TK2), latency=4)
+                h1_acc = ct.mma(x_t, w1_t, h1_acc)
+            for k3 in range(ct.cdiv(N3, TK3)):
+                dout_t = ct.load(DOUT, (pm, k3), shape=(TM, TK3), latency=4)
+                w3_t = ct.load(W3, (k2, k3), shape=(TK2, TK3), latency=4)
+                w3_t = ct.transpose(w3_t)
+                dh1_acc = ct.mma(dout_t, w3_t, dh1_acc)
+            dh1 = dh1_acc * softplus_grad_tile(h1_acc)
+            ct.store(DH1, (pm, k2), ct.astype(dh1, ct.float16))
+
+        # ---- Stage 2: dx = dh2 @ W1^T where dh2 = (dh1 @ W2^T) * sigmoid(h0) ----
+        for k2 in range(ct.cdiv(N1, TK2)):
+            h0_acc = ct.zeros((TM, TK2), ct.float32)
+            for kk in range(ct.cdiv(K1, TK1)):
+                x_t = ct.load(X, (pm, kk), shape=(TM, TK1), latency=4)
+                w1_t = ct.load(W1, (kk, k2), shape=(TK1, TK2), latency=4)
+                h0_acc = ct.mma(x_t, w1_t, h0_acc)
+            dh2_acc = ct.zeros((TM, TK2), ct.float32)
+            for k2p in range(ct.cdiv(N2, TK2)):
+                dh1_t = ct.load(DH1, (pm, k2p), shape=(TM, TK2), latency=4)
+                w2_t = ct.load(W2, (k2, k2p), shape=(TK2, TK2), latency=4)
+                w2_t = ct.transpose(w2_t)
+                dh2_acc = ct.mma(dh1_t, w2_t, dh2_acc)
+            dh2 = dh2_acc * softplus_grad_tile(h0_acc)
+            dh2_f16 = ct.astype(dh2, ct.float16)
+            for k1 in range(ct.cdiv(K1, TK1)):
+                w1_t = ct.load(W1, (k1, k2), shape=(TK1, TK2), latency=4)
+                w1_t = ct.transpose(w1_t)
+                dx_acc = ct.zeros((TM, TK1), ct.float32)
+                dx_acc = ct.mma(dh2_f16, w1_t, dx_acc)
+                rows = ct.arange(TM, dtype=ct.int32) + pm * TM
+                cols = ct.arange(TK1, dtype=ct.int32) + k1 * TK1
+                row_idx = ct.reshape(rows, (TM, 1))
+                col_idx = ct.reshape(cols, (1, TK1))
+                ct.atomic_add(DX, (row_idx, col_idx), dx_acc)
+
+
+@ct.kernel
+def bwd_wgrad3_kernel(
+    X, W1, W2, W3, DOUT, DW3,
+    M,
+    K1: ct.Constant[int], N1: ct.Constant[int], N2: ct.Constant[int], N3: ct.Constant[int],
+    TM: ct.Constant[int], TK1: ct.Constant[int], TK2: ct.Constant[int], TK3: ct.Constant[int],
+):
+    """dW3 = H2^T @ dout, accumulated atomically over M-tiles."""
+    raw_pid = ct.bid(0)
+    num_pids = ct.num_blocks(0)
+    num_k3 = ct.cdiv(N2, TK3)
+    num_n3 = ct.cdiv(N3, TK3)
+    num_m = ct.cdiv(M, TM)
+    num_tiles = num_k3 * num_n3
+
+    for tile_id in range(raw_pid, num_tiles, num_pids):
+        pk3 = tile_id % num_k3
+        pn3 = tile_id // num_k3
+        dw3_acc = ct.zeros((TK3, TK3), ct.float32)
+        for pm in range(num_m):
+            h2_acc = ct.zeros((TM, TK3), ct.float32)
+            for k2 in range(ct.cdiv(N1, TK2)):
+                h1_acc = ct.zeros((TM, TK2), ct.float32)
+                for k1 in range(ct.cdiv(K1, TK1)):
+                    x_t = ct.load(X, (pm, k1), shape=(TM, TK1), latency=4)
+                    w1_t = ct.load(W1, (k1, k2), shape=(TK1, TK2), latency=4)
+                    h1_acc = ct.mma(x_t, w1_t, h1_acc)
+                h1 = softplus_tile(h1_acc)
+                h1_f16 = ct.astype(h1, ct.float16)
+                w2_t = ct.load(W2, (k2, pk3), shape=(TK2, TK3), latency=4)
+                h2_acc = ct.mma(h1_f16, w2_t, h2_acc)
+            h2 = softplus_tile(h2_acc)
+            h2_f16 = ct.astype(h2, ct.float16)
+            h2_t = ct.transpose(h2_f16)
+            dout_t = ct.load(DOUT, (pm, pn3), shape=(TM, TK3), latency=4)
+            dw3_acc = ct.mma(h2_t, dout_t, dw3_acc)
+        rows = ct.arange(TK3, dtype=ct.int32) + pk3 * TK3
+        cols = ct.arange(TK3, dtype=ct.int32) + pn3 * TK3
+        row_idx = ct.reshape(rows, (TK3, 1))
+        col_idx = ct.reshape(cols, (1, TK3))
+        ct.atomic_add(DW3, (row_idx, col_idx), dw3_acc)
+
+
+@ct.kernel
+def bwd_wgrad2_kernel(
+    X, W1, DH1, DW2,
+    M,
+    K1: ct.Constant[int], N1: ct.Constant[int], N2: ct.Constant[int],
+    TM: ct.Constant[int], TK1: ct.Constant[int], TK2: ct.Constant[int],
+):
+    """dW2 = H1^T @ dh1, accumulated atomically over M-tiles."""
+    raw_pid = ct.bid(0)
+    num_pids = ct.num_blocks(0)
+    num_k2 = ct.cdiv(N1, TK2)
+    num_k3 = ct.cdiv(N2, TK2)
+    num_m = ct.cdiv(M, TM)
+    num_tiles = num_k2 * num_k3
+
+    for tile_id in range(raw_pid, num_tiles, num_pids):
+        pk2 = tile_id % num_k2
+        pk3 = tile_id // num_k2
+        dw2_acc = ct.zeros((TK2, TK2), ct.float32)
+        for pm in range(num_m):
+            h1_acc = ct.zeros((TM, TK2), ct.float32)
+            for k1 in range(ct.cdiv(K1, TK1)):
+                x_t = ct.load(X, (pm, k1), shape=(TM, TK1), latency=4)
+                w1_t = ct.load(W1, (k1, pk2), shape=(TK1, TK2), latency=4)
+                h1_acc = ct.mma(x_t, w1_t, h1_acc)
+            h1 = softplus_tile(h1_acc)
+            h1_f16 = ct.astype(h1, ct.float16)
+            h1_t = ct.transpose(h1_f16)
+            dh1_t = ct.load(DH1, (pm, pk3), shape=(TM, TK2), latency=4)
+            dw2_acc = ct.mma(h1_t, dh1_t, dw2_acc)
+        rows = ct.arange(TK2, dtype=ct.int32) + pk2 * TK2
+        cols = ct.arange(TK2, dtype=ct.int32) + pk3 * TK2
+        row_idx = ct.reshape(rows, (TK2, 1))
+        col_idx = ct.reshape(cols, (1, TK2))
+        ct.atomic_add(DW2, (row_idx, col_idx), dw2_acc)
+
+
+@ct.kernel
+def bwd_wgrad1_kernel(
+    X, W1, DH1, W2, DW1,
+    M,
+    K1: ct.Constant[int], N1: ct.Constant[int], N2: ct.Constant[int],
+    TM: ct.Constant[int], TK1: ct.Constant[int], TK2: ct.Constant[int],
+):
+    """dW1 = X^T @ dh2, accumulated atomically over M-tiles."""
+    raw_pid = ct.bid(0)
+    num_pids = ct.num_blocks(0)
+    num_k1 = ct.cdiv(K1, TK1)
+    num_k2 = ct.cdiv(N1, TK2)
+    num_m = ct.cdiv(M, TM)
+    num_tiles = num_k1 * num_k2
+
+    for tile_id in range(raw_pid, num_tiles, num_pids):
+        pk1 = tile_id % num_k1
+        pk2 = tile_id // num_k1
+        dw1_acc = ct.zeros((TK1, TK2), ct.float32)
+        for pm in range(num_m):
+            h0_acc = ct.zeros((TM, TK2), ct.float32)
+            for k1 in range(ct.cdiv(K1, TK1)):
+                x_t = ct.load(X, (pm, k1), shape=(TM, TK1), latency=4)
+                w1_t = ct.load(W1, (k1, pk2), shape=(TK1, TK2), latency=4)
+                h0_acc = ct.mma(x_t, w1_t, h0_acc)
+            dh2_acc = ct.zeros((TM, TK2), ct.float32)
+            for k2 in range(ct.cdiv(N2, TK2)):
+                dh1_t = ct.load(DH1, (pm, k2), shape=(TM, TK2), latency=4)
+                w2_t = ct.load(W2, (pk2, k2), shape=(TK2, TK2), latency=4)
+                w2_t = ct.transpose(w2_t)
+                dh2_acc = ct.mma(dh1_t, w2_t, dh2_acc)
+            dh2 = dh2_acc * softplus_grad_tile(h0_acc)
+            dh2_f16 = ct.astype(dh2, ct.float16)
+            x_t = ct.load(X, (pm, pk1), shape=(TM, TK1), latency=4)
+            x_t = ct.transpose(x_t)
+            dw1_acc = ct.mma(x_t, dh2_f16, dw1_acc)
+        rows = ct.arange(TK1, dtype=ct.int32) + pk1 * TK1
+        cols = ct.arange(TK2, dtype=ct.int32) + pk2 * TK2
+        row_idx = ct.reshape(rows, (TK1, 1))
+        col_idx = ct.reshape(cols, (1, TK2))
+        ct.atomic_add(DW1, (row_idx, col_idx), dw1_acc)
+
+
+def fused_mlp_bwd_cutile(dout, x, w1, w2, w3):
+    """Fused backward: returns (dx, dW1, dW2, dW3)."""
+    M, K1 = x.shape
+    N1 = w1.shape[1]
+    N2 = w2.shape[1]
+    N3 = w3.shape[1]
+
+    dout = dout.contiguous()
+    x = x.contiguous()
+    w1 = w1.contiguous()
+    w2 = w2.contiguous()
+    w3 = w3.contiguous()
+
+    dx32 = torch.zeros((M, K1), device=x.device, dtype=torch.float32)
+    dh1 = torch.empty((M, N2), device=x.device, dtype=x.dtype)
+    dw1_32 = torch.zeros((K1, N1), device=x.device, dtype=torch.float32)
+    dw2_32 = torch.zeros((N1, N2), device=x.device, dtype=torch.float32)
+    dw3_32 = torch.zeros((N2, N3), device=x.device, dtype=torch.float32)
+
+    stream = torch.cuda.current_stream()
+    num_sms = _get_num_sms()
+
+    TM = 64 if M >= 64 else 16
+    TK1 = min(64, K1)
+    TK2 = min(128, N1)
+    TK3 = min(128, N2)
+    grid = (min(num_sms, (M + TM - 1) // TM),)
+    ct.launch(stream, grid, bwd_dgrad_kernel, (
+        x, w1, w2, w3, dout, dh1, dx32, M,
+        K1, N1, N2, N3, TM, TK1, TK2, TK3,
+    ))
+
+    grid_w3 = (min(num_sms, (N2 + TK3 - 1) // TK3 * ((N3 + TK3 - 1) // TK3)),)
+    ct.launch(stream, grid_w3, bwd_wgrad3_kernel, (
+        x, w1, w2, w3, dout, dw3_32, M, K1, N1, N2, N3, TM, TK1, TK2, TK3,
+    ))
+    grid_w2 = (min(num_sms, (N1 + TK2 - 1) // TK2 * ((N2 + TK2 - 1) // TK2)),)
+    ct.launch(stream, grid_w2, bwd_wgrad2_kernel, (
+        x, w1, dh1, dw2_32, M, K1, N1, N2, TM, TK1, TK2,
+    ))
+    grid_w1 = (min(num_sms, (K1 + TK1 - 1) // TK1 * ((N1 + TK2 - 1) // TK2)),)
+    ct.launch(stream, grid_w1, bwd_wgrad1_kernel, (
+        x, w1, dh1, w2, dw1_32, M, K1, N1, N2, TM, TK1, TK2,
+    ))
+
+    return (dx32.to(x.dtype), dw1_32.to(x.dtype),
+            dw2_32.to(x.dtype), dw3_32.to(x.dtype))
+
+
+class FusedMLPCutile(torch.autograd.Function):
+    """Fused cuTile MLP: forward + backward in custom autograd Function."""
+
+    @staticmethod
+    def forward(ctx, x, w1, w2, w3):
+        ctx.save_for_backward(x, w1, w2, w3)
+        return fused_mlp_fwd_cutile(x, w1, w2, w3)
+
+    @staticmethod
+    def backward(ctx, dout):
+        x, w1, w2, w3 = ctx.saved_tensors
+        dx, dw1, dw2, dw3 = fused_mlp_bwd_cutile(dout, x, w1, w2, w3)
+        return dx, dw1, dw2, dw3
+
+
+def fused_mlp_cutile(x, w1, w2, w3):
+    """Convenience wrapper: fused forward + backward via autograd.Function."""
+    return FusedMLPCutile.apply(x, w1, w2, w3)
+
+
 if __name__ == "__main__":
     import sys
+    import torch.nn.functional as F
 
     M = int(sys.argv[1]) if len(sys.argv) > 1 else 256
     D = int(sys.argv[2]) if len(sys.argv) > 2 else 128
@@ -650,16 +914,44 @@ if __name__ == "__main__":
     w2 = torch.randn(H, H, dtype=torch.float16, device='cuda') * 0.02
     w3 = torch.randn(H, OUT_F, dtype=torch.float16, device='cuda') * 0.02
 
-    h1 = torch.nn.functional.softplus(x @ w1)
-    h2 = torch.nn.functional.softplus(h1 @ w2)
+    h1 = F.softplus(x @ w1)
+    h2 = F.softplus(h1 @ w2)
     ref = h2 @ w3
 
     out = fused_mlp_fwd_cutile(x, w1, w2, w3)
     torch.cuda.synchronize()
 
     max_diff = (out - ref).abs().max().item()
-    cos = torch.nn.functional.cosine_similarity(ref.flatten(), out.flatten(), dim=0).item()
+    cos = F.cosine_similarity(ref.flatten(), out.flatten(), dim=0).item()
     passed = torch.allclose(out, ref, atol=1e-2, rtol=1e-2)
     print(f"Shape: M={M}, D={D}, H={H}, OUT={OUT_F}")
-    print(f"max diff: {max_diff}, cosine sim: {cos:.6f}")
-    print("PASS" if passed else "FAIL")
+    print(f"Forward: max diff={max_diff:.6f}, cos={cos:.6f} {'PASS' if passed else 'FAIL'}")
+
+    # Test backward
+    x.requires_grad_(True)
+    w1.requires_grad_(True)
+    w2.requires_grad_(True)
+    w3.requires_grad_(True)
+
+    out_ref = F.softplus(F.softplus(x @ w1) @ w2) @ w3
+    out_ref.sum().backward()
+    ref_dx, ref_dw1, ref_dw2, ref_dw3 = x.grad.clone(), w1.grad.clone(), w2.grad.clone(), w3.grad.clone()
+
+    x.grad = w1.grad = w2.grad = w3.grad = None
+    out_ct = fused_mlp_cutile(x, w1, w2, w3)
+    out_ct.sum().backward()
+
+    def check(name, got, ref):
+        diff = (got - ref).abs().max().item()
+        cos = F.cosine_similarity(ref.flatten(), got.flatten(), dim=0).item()
+        ok = cos >= 0.99
+        print(f"  {name}: diff={diff:.6f} cos={cos:.6f} {'PASS' if ok else 'FAIL'}")
+        return ok
+
+    print("Backward:")
+    all_ok = True
+    all_ok &= check("dx", x.grad, ref_dx)
+    all_ok &= check("dW1", w1.grad, ref_dw1)
+    all_ok &= check("dW2", w2.grad, ref_dw2)
+    all_ok &= check("dW3", w3.grad, ref_dw3)
+    print("ALL PASS" if (passed and all_ok) else "SOME FAILED")
