@@ -24,7 +24,7 @@ Triton megakernels that fuse entire multi-layer MLPs with Softplus activations i
 
 - **FP32 accumulation, FP16 Tensor Cores**: all `tl.dot` accumulate in fp32; conversion to fp16 only happens at tile boundaries for Tensor Core GEMMs.
 
-- **FP32 activation storage for training**: forward pass stores activations in fp32 to avoid numerical loss in the backward sigmoid derivative. Backward loads fp32 activations and casts to fp16 only for GEMM operands.
+- **FP16 activation storage for training**: forward stores pre-activations in fp16; the backward recomputes sigmoid(pre)*softplus(pre) from them (one exp) for both the dgrad chain and the wgrad A-operands. Cosine vs fp32 eager stays >= 0.997 (gate 0.99).
 
 - **Atomic backward for small batches**: below 32K batch size, weight gradients are accumulated via `tl.atomic_add` in a single fused kernel. Above that threshold, falls back to cuBLAS GEMMs interleaved with data-gradient computation for L2 cache reuse.
 
@@ -182,16 +182,35 @@ autotune per shape (no disk cache for sm_89 — 1080-config phase-1 tile sweep
 
 cut-inf beats PyTorch eager at every shape (1.6–2.4x) and ties or beats
 Triton at every shape except 4096–16384 (0.97–0.98x, within noise).
-cut-train costs 1.05–1.6x cut-inf for fp32 activation storage, growing with
+cut-train costs 1.05–1.6x cut-inf for activation storage, growing with
 M as store traffic dominates.
 
-#### Forward + Backward pass
+#### Backward pass (split-K wgrad, RTX 4090)
 
-⚠️ Preliminary — the 4090 bwd numbers from the fresh run are noisy (PyTorch
-eager bwd times non-monotonic across M, e.g. 221us@256 vs 73us@512, likely
-GPU clock ramp on the idle card) and cuTile bwd **fails correctness at
-M=65536** (cosine < 0.99 on dx/dW1). Re-run pending; GB10 bwd table above is
-the reliable reference.
+The backward is split into a persistent dgrad kernel (dh1/dh2/dx + per-block
+dW1 partials) and two split-K wgrad kernels (dW2/dW3 contract over the batch
+dim across 128 blocks) with a deterministic tiled reduction — no atomics, no
+register-resident-across-kernel accumulators. Activations are stored fp16
+and the wgrad A-operand is recomputed as sigmoid(pre)*softplus(pre).
+do_bench L2-flushed, warmup=10, rep=50, bwd-only path (stored acts,
+random dout); eager = PyTorch fwd+bwd.
+
+| M | old fused bwd (us) | split-K bwd (us) | PyTorch eager fwd+bwd (us) | speedup vs old | vs eager |
+|---|---|---|---|---|---|
+| 256 | 84.1 | **36.1** | 44.2 | 2.3x | 1.22x |
+| 512 | 90.2 | **36.0** | 48.7 | 2.5x | 1.35x |
+| 1024 | 141.0 | **54.5** | 54.4 | 2.6x | 1.00x |
+| 2048 | 153.9 | **89.9** | 58.5 | 1.7x | 0.65x* |
+| 4096 | 157.4 | **115.9** | 70.8 | 1.4x | 0.61x* |
+| 8192 | 177.1 | **134.0** | 82.1 | 1.3x | 0.61x* |
+| 16384 | 215.3 | **167.7** | 119.3 | 1.3x | 0.71x* |
+| 32768 | 291.9 | **226.9** | 169.2 | 1.3x | 0.75x* |
+| 65536 | 436.0 | **359.9** | 369.8 | 1.2x | 1.03x |
+
+* eager fwd+bwd includes the forward pass; the cuTile bwd column is
+backward-only. Correctness gate (cosine >= 0.99 vs eager, all of
+dx/dW1/dW2/dW3) passes at every M; the old fused bwd failed it at M=65536.
+dW3 cosine is 0.997 (fp16 pre-activation recompute); all others are 1.0.
 
 #### Train vs Inference autotune config comparison
 
