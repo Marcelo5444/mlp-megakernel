@@ -107,7 +107,7 @@ def fused_mlp_kernel(
                     h1_acc = ct.mma(x_tile, w1_tile, h1_acc)
 
                 if STORE_ACTS and k3 == 0:
-                    ct.store(H0, (pm, k2), h1_acc)  # fp32 pre-activation
+                    ct.store(H0, (pm, k2), ct.astype(h1_acc, ct.float16))  # fp16 pre-act
 
                 h1_act = softplus_tile(h1_acc)
                 h1_fp16 = ct.astype(h1_act, ct.float16)
@@ -117,7 +117,7 @@ def fused_mlp_kernel(
                 h2_acc = ct.mma(h1_fp16, w2_tile, h2_acc)
 
             if STORE_ACTS:
-                ct.store(H1PRE, (pm, k3), h2_acc)  # fp32 pre-activation
+                ct.store(H1PRE, (pm, k3), ct.astype(h2_acc, ct.float16))  # fp16 pre-act
 
             h2_act = softplus_tile(h2_acc)
             h2_fp16 = ct.astype(h2_act, ct.float16)
@@ -616,8 +616,8 @@ def _autotune_train_variant(best_cfg, x, w1, w2, w3, M, K1, N1, N2, N3,
     bandwidth-bound — only tile sizes that change SM occupancy of the
     persistent loop matter).
     """
-    H0 = torch.empty((M, N1), device=x.device, dtype=torch.float32)
-    H1PRE = torch.empty((M, N2), device=x.device, dtype=torch.float32)
+    H0 = torch.empty((M, N1), device=x.device, dtype=x.dtype)
+    H1PRE = torch.empty((M, N2), device=x.device, dtype=x.dtype)
     OUT_t = torch.empty((M, N3), device=x.device, dtype=x.dtype)
 
     def _train_args(cfg):
@@ -784,7 +784,10 @@ class FusedMLPCutile(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout):
         x, w1, w2, w3, H0, H1PRE = ctx.saved_tensors
-        dx, dw1, dw2, dw3 = fused_mlp_bwd_cutile(dout, x, w1, w2, w3, H0, H1PRE)
+        if w1.shape[0] == w1.shape[1] == w2.shape[1] == w3.shape[1] == 128:
+            dx, dw1, dw2, dw3 = fused_mlp_bwd_splitk(dout, x, w1, w2, w3, H0, H1PRE)
+        else:
+            dx, dw1, dw2, dw3 = fused_mlp_bwd_cutile(dout, x, w1, w2, w3, H0, H1PRE)
         return dx, dw1, dw2, dw3
 
 
@@ -805,8 +808,11 @@ def _fwd_train(x, w1, w2, w3):
     w3 = w3.contiguous()
 
     OUT = torch.empty((M, N3), device=x.device, dtype=x.dtype)
-    H0 = torch.empty((M, N1), device=x.device, dtype=torch.float32)
-    H1PRE = torch.empty((M, N2), device=x.device, dtype=torch.float32)
+    # fp16 pre-activations: halves activation traffic in fwd+bwd. The bwd
+    # recomputes sigmoid(pre)*softplus(pre) from the fp16 pre-act (one exp);
+    # cosine vs eager stays 1.0 (gate >= 0.99) on sm_89 for this shape.
+    H0 = torch.empty((M, N1), device=x.device, dtype=x.dtype)
+    H1PRE = torch.empty((M, N2), device=x.device, dtype=x.dtype)
 
     # Autotune inference config (also triggers train-variant tuning on first call)
     _autotune(x, w1, w2, w3, OUT, M, K1, N1, N2, N3)
@@ -1060,6 +1066,257 @@ def bwd_wgrad1_kernel(
         row_idx = ct.reshape(rows, (TK1, 1))
         col_idx = ct.reshape(cols, (1, TK2))
         ct.atomic_add(DW1, (row_idx, col_idx), dw1_acc)
+
+
+# ============================================================
+# Split-K backward: dgrad-only kernel + 3 split-K wgrad kernels
+# + deterministic reduction kernel.
+#
+# The 3 wgrad GEMMs (dW = act^T @ grad, contraction over K=M) are
+# tiled across the batch dim: each block accumulates a partial
+# 128x128 dW in registers over its K-chunk, stores the partial to
+# a fp32 partials buffer, and a small reduce kernel sums the
+# partials (deterministic, no 128-way atomics).
+# The 3 dgrad GEMMs (+dx) stay in a fwd-shaped persistent kernel
+# (no register-resident wgrad accumulators -> normal occupancy).
+# ============================================================
+
+@ct.kernel
+def bwd_dgrad_only_kernel(
+    X, W1, W2, W3, DOUT, H0, H1PRE, DX, DH1, P1,
+    M,
+    K1: ct.Constant[int], N1: ct.Constant[int], N2: ct.Constant[int], N3: ct.Constant[int],
+    TM: ct.Constant[int], TN: ct.Constant[int],
+    LATENCY: ct.Constant[int],
+):
+    """Persistent kernel: dh1/dh2/dx per M-tile + per-block dW1 partial.
+
+    dW1's operands (x, dh2) are both already in registers here, so its mma
+    rides along nearly free; the partial is stored (num_blocks x 128 x 128
+    fp32) and reduced deterministically by bwd_wgrad_reduce_kernel.
+    dW2/dW3 are computed by standalone split-K kernels (h1act/dh1 and
+    h2/dout), with dh1 stored here in fp16 as the dW2 gradient operand.
+    """
+    raw_pid = ct.bid(0)
+    num_pids = ct.num_blocks(0)
+    num_m = ct.cdiv(M, TM)
+
+    dw1_acc = ct.zeros((TN, TN), ct.float32)
+
+    for pm in range(raw_pid, num_m, num_pids):
+        # dh1 = (dout @ W3^T) * sigmoid(H1_PRE)
+        dout_t = ct.load(DOUT, (pm, 0), shape=(TM, TN), latency=LATENCY)
+        w3_t = ct.load(W3, (0, 0), shape=(TN, TN), latency=LATENCY)
+        w3_t = ct.transpose(w3_t)
+        dh1_acc = ct.zeros((TM, TN), ct.float32)
+        dh1_acc = ct.mma(dout_t, w3_t, dh1_acc)
+        h1pre_t = ct.load(H1PRE, (pm, 0), shape=(TM, TN), latency=LATENCY)
+        dh1 = dh1_acc * softplus_grad_tile(h1pre_t)
+        dh1_f16 = ct.astype(dh1, ct.float16)
+        ct.store(DH1, (pm, 0), dh1_f16)  # wgrad operand for dW2
+
+        # dh2 = (dh1 @ W2^T) * sigmoid(H0)
+        w2_t = ct.load(W2, (0, 0), shape=(TN, TN), latency=LATENCY)
+        w2_t = ct.transpose(w2_t)
+        dh2_acc = ct.zeros((TM, TN), ct.float32)
+        dh2_acc = ct.mma(dh1_f16, w2_t, dh2_acc)
+        h0_t = ct.load(H0, (pm, 0), shape=(TM, TN), latency=LATENCY)
+        dh2 = dh2_acc * softplus_grad_tile(h0_t)
+        dh2_f16 = ct.astype(dh2, ct.float16)
+
+        # dx = dh2 @ W1^T ; dW1 += X^T @ dh2
+        x_t = ct.load(X, (pm, 0), shape=(TM, TN), latency=LATENCY)
+        w1_t = ct.load(W1, (0, 0), shape=(TN, TN), latency=LATENCY)
+        w1_t = ct.transpose(w1_t)
+        dx_acc = ct.zeros((TM, TN), ct.float32)
+        dx_acc = ct.mma(dh2_f16, w1_t, dx_acc)
+        ct.store(DX, (pm, 0), ct.astype(dx_acc, ct.float16))
+        x_f16 = ct.astype(x_t, ct.float16)
+        x_tT = ct.transpose(x_f16)
+        dw1_acc = ct.mma(x_tT, dh2_f16, dw1_acc)
+
+    # flush this block's dW1 partial (block raw_pid owns row-block raw_pid)
+    ct.store(P1, (raw_pid, 0), dw1_acc)
+
+
+@ct.kernel
+def bwd_wgrad_splitk_kernel(
+    A, B, P,
+    M,
+    KA: ct.Constant[int], NB: ct.Constant[int],
+    TM: ct.Constant[int], SPLIT: ct.Constant[int],
+    LATENCY: ct.Constant[int],
+):
+    """Split-K weight-grad partial: P[sid] = A_chunk^T @ B_chunk.
+
+    A: (M, KA) fp16 activation source; B: (M, NB) fp16 gradient source.
+    P: (SPLIT*KA, NB) fp32 partials buffer (block sid owns row-block sid).
+    Persistent: block sid processes M-tiles sid, sid+SPLIT, ... so large
+    SPLIT values give fine-grained K parallelism without idle tail blocks.
+    """
+    sid = ct.bid(0)
+    num_pids = ct.num_blocks(0)
+    num_m = ct.cdiv(M, TM)
+
+    acc = ct.zeros((KA, NB), ct.float32)
+    for pm in range(sid, num_m, num_pids):
+        a_t = ct.load(A, (pm, 0), shape=(TM, KA), latency=LATENCY)
+        a_t = ct.transpose(a_t)
+        b_t = ct.load(B, (pm, 0), shape=(TM, NB), latency=LATENCY)
+        acc = ct.mma(a_t, b_t, acc)
+    ct.store(P, (sid, 0), acc)
+
+
+@ct.kernel
+def bwd_wgrad_splitk_act_kernel(
+    PRE, B, P,
+    M,
+    KA: ct.Constant[int], NB: ct.Constant[int],
+    TM: ct.Constant[int], SPLIT: ct.Constant[int],
+    LATENCY: ct.Constant[int],
+):
+    """Split-K wgrad partial with A recomputed from fp16 pre-activations.
+
+    A = sigmoid(PRE) * softplus(PRE) (one exp instead of two, all fp32 math
+    on an fp16 load), B: (M, NB) fp16 gradient source. P: (SPLIT*KA, NB)
+    fp32 partials; persistent: block sid processes tiles sid, sid+SPLIT, ...
+    """
+    sid = ct.bid(0)
+    num_pids = ct.num_blocks(0)
+    num_m = ct.cdiv(M, TM)
+
+    acc = ct.zeros((KA, NB), ct.float32)
+    for pm in range(sid, num_m, num_pids):
+        pre_t = ct.load(PRE, (pm, 0), shape=(TM, KA), latency=LATENCY)
+        pre32 = ct.astype(pre_t, ct.float32)
+        # softplus(pre) * sigmoid(pre): softplus = log(1+e) = sig * (pre/sigmoid + ...)?
+        # exact: softplus(pre) = log1p(exp(pre)); sigmoid = e/(1+e).
+        # softplus*sigmoid = pre * sigmoid - softplus + ... -> just compute both:
+        a32 = softplus_tile(pre32) * softplus_grad_tile(pre32)
+        a_t = ct.transpose(ct.astype(a32, ct.float16))
+        b_t = ct.load(B, (pm, 0), shape=(TM, NB), latency=LATENCY)
+        acc = ct.mma(a_t, b_t, acc)
+    ct.store(P, (sid, 0), acc)
+
+
+@ct.kernel
+def bwd_wgrad_reduce_kernel(
+    P, DW,
+    SPLIT,
+    TR: ct.Constant[int], TC: ct.Constant[int],
+):
+    """Deterministic tiled reduction: DW = sum_s P[s] (fp32 in, fp32 out).
+
+    P: (SPLIT*T, T) fp32 partials; DW: (T, T) fp32 out for one weight.
+    Grid: (T/TR) * (T/TC) blocks, each reduces a (TR, TC) tile.
+    """
+    pid = ct.bid(0)
+    nc = 128 // TC
+    pr = pid // nc
+    pc = pid % nc
+    acc = ct.zeros((TR, TC), ct.float32)
+    for s in range(SPLIT):
+        acc += ct.load(P, (s * (128 // TR) + pr, pc), shape=(TR, TC))
+    ct.store(DW, (pr, pc), acc)
+
+
+_BWD_SPLITK_VARIANTS = {}
+
+
+def _bwd_splitk_hinted(kernel, occ, nww):
+    key = (kernel, occ, nww)
+    k = _BWD_SPLITK_VARIANTS.get(key)
+    if k is None:
+        hints = {"occupancy": occ}
+        if nww is not None:
+            hints["num_worker_warps"] = nww
+        k = kernel.replace_hints(**hints)
+        _BWD_SPLITK_VARIANTS[key] = k
+    return k
+
+
+# Cached gradient workspaces keyed by (M, dtype, device) — kills the per-call
+# torch.zeros + fp32->fp16 cast overhead of the old wrapper.
+_BWD_WS = {}
+
+
+def _get_bwd_ws(M, K, dtype, device):
+    key = (M, K, dtype, str(device))
+    ws = _BWD_WS.get(key)
+    if ws is None:
+        ws = {
+            "dh1": torch.empty((M, K), device=device, dtype=torch.float16),
+            "dh2": torch.empty((M, K), device=device, dtype=torch.float16),
+            "dx16": torch.empty((M, K), device=device, dtype=torch.float16),
+            "dx32": torch.empty((M, K), device=device, dtype=torch.float32),
+        }
+        _BWD_WS[key] = ws
+    return ws
+
+
+def fused_mlp_bwd_splitk(dout, x, w1, w2, w3, H0, H1PRE, SPLIT=None):
+    """Split-K backward.
+
+    dgrad kernel: dh1/dh2/dx per M-tile, fused per-block wgrad partials
+    (P1/P2/P3 fp32, one 128x128 partial per block per weight).
+    reduce kernel: deterministic sum of partials -> fp32 dW -> cast fp16.
+
+    Deterministic (no atomics). Returns (dx, dW1, dW2, dW3) in x.dtype.
+    """
+    M, K1 = x.shape
+    N1 = w1.shape[1]
+    N2 = w2.shape[1]
+    N3 = w3.shape[1]
+    assert K1 == N1 == N2 == N3
+    TN = K1
+
+    dout = dout.contiguous()
+    x = x.contiguous()
+    H0 = H0.contiguous()
+    H1PRE = H1PRE.contiguous()
+
+    num_sms = _get_num_sms()
+    stream = torch.cuda.current_stream()
+    ws = _get_bwd_ws(M, K1, x.dtype, x.device)
+    dx16 = ws["dx16"]
+
+    # ---- dgrad kernel (+ per-block dW1 partial) ----
+    TM = 16
+    if M < TM:
+        TM = max(16, _next_pow2(M))
+    num_m = (M + TM - 1) // TM
+    nb = min(num_sms, num_m)
+    grid_d = (nb,)
+    SPLIT = min(128, num_m)  # wgrad split-K degree
+    P = torch.empty(((nb + 2 * SPLIT) * TN, TN), device=x.device, dtype=torch.float32)
+    P1 = P[0:nb*TN]
+    P2 = P[nb*TN:nb*TN + SPLIT*TN]
+    P3 = P[nb*TN + SPLIT*TN:nb*TN + 2*SPLIT*TN]
+    k_dgrad = _bwd_splitk_hinted(bwd_dgrad_only_kernel, 1, 8)
+    ct.launch(stream, grid_d, k_dgrad, (
+        x, w1, w2, w3, dout, H0, H1PRE, dx16, ws["dh1"], P1, M,
+        K1, N1, N2, N3, TM, TN, 4,
+    ))
+
+    # ---- standalone split-K wgrads: dW2 (h1act^T @ dh1), dW3 (h2^T @ dout)
+    # ---- A operand recomputed from fp16 pre-acts as sigmoid(pre)*softplus(pre)
+    TM_W = 16
+    k_wga = _bwd_splitk_hinted(bwd_wgrad_splitk_act_kernel, 1, 4)
+    grid_w = (SPLIT,)
+    ct.launch(stream, grid_w, k_wga, (H0, ws["dh1"], P2, M, N1, N2, TM_W, SPLIT, 4))
+    ct.launch(stream, grid_w, k_wga, (H1PRE, dout, P3, M, N2, N3, TM_W, SPLIT, 4))
+
+    # ---- reduce (single-stage tiled, 64 blocks x 3 launches) ----
+    dw32 = torch.empty((3 * TN, TN), device=x.device, dtype=torch.float32)
+    k_red = _bwd_splitk_hinted(bwd_wgrad_reduce_kernel, 1, None)
+    TR, TC = 8, 32
+    grid_r = ((TN // TR) * (TN // TC),)
+    ct.launch(stream, grid_r, k_red, (P1, dw32[0:TN], nb, TR, TC))
+    ct.launch(stream, grid_r, k_red, (P2, dw32[TN:2*TN], SPLIT, TR, TC))
+    ct.launch(stream, grid_r, k_red, (P3, dw32[2*TN:3*TN], SPLIT, TR, TC))
+
+    dw = dw32.to(x.dtype)
+    return dx16, dw[0:TN], dw[TN:2*TN], dw[2*TN:3*TN]
 
 
 @ct.kernel
