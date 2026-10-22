@@ -33,14 +33,21 @@ def pytorch_fwd_compile(x, w1, w2, w3):
 
 
 from kernel import ModelNew as TritonMLP
-from cutile_mlp import fused_mlp_fwd_cutile, fused_mlp_cutile
+from cutile_mlp import (fused_mlp_fwd_cutile, fused_mlp_fwd_store_acts,
+                        fused_mlp_cutile)
 
 triton_model = TritonMLP()
 
 Ms = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]
 
+# Matched-context forward comparison:
+#  - "cutile-inf"   = inference-only forward (no activation storage) — fair vs
+#                     torch.no_grad / deployment inference.
+#  - "cutile-train" = forward WITH fp32 H0/H1_PRE activation storage — this is
+#                     the forward actually paid in the fwd+bwd pass below, fair
+#                     vs PyTorch eager forward with autograd state.
 print("=== FORWARD PASS (do_bench, L2 flushed) ===")
-print(f"{'M':>7} {'pytorch':>10} {'t.compile':>10} {'triton':>10} {'cutile':>10} {'T spd':>6} {'C spd':>6} {'PC spd':>7} {'C vs T':>7}")
+print(f"{'M':>7} {'pytorch':>10} {'t.compile':>10} {'triton':>10} {'cut-inf':>10} {'cut-train':>10} {'T spd':>6} {'C spd':>6} {'PC spd':>7}")
 rows_fwd = []
 for M in Ms:
     x = torch.randn(M, D, dtype=torch.float16, device='cuda') * 0.02
@@ -51,18 +58,21 @@ for M in Ms:
     ref = pytorch_fwd_ref(x, w1, w2, w3)
     out_t = triton_model(x, w1, w2, w3)
     out_c = fused_mlp_fwd_cutile(x, w1, w2, w3)
+    out_s, _, _ = fused_mlp_fwd_store_acts(x, w1, w2, w3)
     torch.cuda.synchronize()
     ok_t = torch.allclose(out_t, ref, atol=1e-2, rtol=1e-2)
     ok_c = torch.allclose(out_c, ref, atol=1e-2, rtol=1e-2)
+    ok_s = torch.allclose(out_s, ref, atol=1e-2, rtol=1e-2)
 
     t_p = do_bench(lambda: pytorch_fwd_ref(x, w1, w2, w3), warmup=25, rep=100) * 1000
     t_pc = do_bench(lambda: pytorch_fwd_compile(x, w1, w2, w3), warmup=25, rep=100) * 1000
     t_t = do_bench(lambda: triton_model(x, w1, w2, w3), warmup=25, rep=100) * 1000
     t_c = do_bench(lambda: fused_mlp_fwd_cutile(x, w1, w2, w3), warmup=25, rep=100) * 1000
+    t_s = do_bench(lambda: fused_mlp_fwd_store_acts(x, w1, w2, w3), warmup=25, rep=100) * 1000
 
-    rows_fwd.append((M, t_p, t_pc, t_t, t_c, ok_t, ok_c))
-    print(f"{M:7d} {t_p:9.1f}u {t_pc:9.1f}u {t_t:9.1f}u {t_c:9.1f}u {t_p/t_t:5.2f}x {t_p/t_c:5.2f}x {t_p/t_pc:6.2f}x {t_t/t_c:6.2f}x"
-          + ("" if (ok_t and ok_c) else "  !!CORRECTNESS"))
+    rows_fwd.append((M, t_p, t_pc, t_t, t_c, t_s, ok_t and ok_c and ok_s))
+    print(f"{M:7d} {t_p:9.1f}u {t_pc:9.1f}u {t_t:9.1f}u {t_c:9.1f}u {t_s:9.1f}u {t_p/t_t:5.2f}x {t_p/t_c:5.2f}x {t_p/t_pc:6.2f}x"
+          + ("" if (ok_t and ok_c and ok_s) else "  !!CORRECTNESS"))
 
 print()
 print("=== FORWARD + BACKWARD PASS (do_bench, L2 flushed) ===")
