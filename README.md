@@ -195,21 +195,24 @@ and the wgrad A-operand is recomputed as sigmoid(pre)*softplus(pre).
 do_bench L2-flushed, warmup=10, rep=50, bwd-only path (stored acts,
 random dout).
 
-| M | old fused bwd (us) | split-K bwd (us) | speedup |
-|---|---|---|---|
-| 256 | 84.1 | **36.1** | 2.3x |
-| 512 | 90.2 | **36.0** | 2.5x |
-| 1024 | 141.0 | **54.5** | 2.6x |
-| 2048 | 153.9 | **89.9** | 1.7x |
-| 4096 | 157.4 | **115.9** | 1.4x |
-| 8192 | 177.1 | **134.0** | 1.3x |
-| 16384 | 215.3 | **167.7** | 1.3x |
-| 32768 | 291.9 | **226.9** | 1.3x |
-| 65536 | 436.0 | **359.9** | 1.2x |
+| M | PyTorch manual bwd (us) | split-K bwd (us) | old fused bwd (us) | split-K vs torch | split-K vs old |
+|---|---|---|---|---|---|
+| 256 | 37.0 | **35.7** | 84.1 | 1.04x | 2.4x |
+| 512 | 42.7 | **39.3** | 90.2 | 1.09x | 2.3x |
+| 1024 | 48.1 | **54.4** | 141.0 | 0.88x | 2.6x |
+| 2048 | 54.6 | **95.5** | 153.9 | 0.57x | 1.6x |
+| 4096 | 64.1 | **113.0** | 157.4 | 0.57x | 1.4x |
+| 8192 | 81.7 | **139.1** | 177.1 | 0.59x | 1.3x |
+| 16384 | 105.2 | **157.4** | 215.3 | 0.67x | 1.4x |
+| 32768 | 187.8 | **233.5** | 291.9 | 0.80x | 1.3x |
+| 65536 | 388.0 | **362.7** | 436.0 | 1.07x | 1.2x |
 
-Correctness gate (cosine >= 0.99 vs eager, all of dx/dW1/dW2/dW3) passes at
-every M; the old fused bwd failed it at M=65536. dW3 cosine is 0.997 (fp16
-pre-activation recompute); all others are 1.0.
+PyTorch manual bwd = chain rule with preallocated cuBLAS GEMMs (no autograd
+overhead), same stored-activations + random-dout protocol. split-K beats
+PyTorch bwd-only at M<=512 and M=65536; cuBLAS split-K wgrads still win at
+mid M (2048-32768). Correctness gate (cosine >= 0.99 vs eager, all of
+dx/dW1/dW2/dW3) passes at every M; the old fused bwd failed it at M=65536.
+dW3 cosine is 0.997 (fp16 pre-activation recompute); all others are 1.0.
 
 #### Train vs Inference autotune config comparison
 
