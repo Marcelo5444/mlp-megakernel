@@ -33,8 +33,7 @@ def pytorch_fwd_compile(x, w1, w2, w3):
 
 
 from kernel import ModelNew as TritonMLP
-from cutile_mlp import (fused_mlp_fwd_cutile, fused_mlp_fwd_store_acts,
-                        fused_mlp_cutile)
+from cutile_mlp import fused_mlp, fused_mlp_fwd_cutile, fused_mlp_cutile, _fwd_train
 
 triton_model = TritonMLP()
 
@@ -58,7 +57,7 @@ for M in Ms:
     ref = pytorch_fwd_ref(x, w1, w2, w3)
     out_t = triton_model(x, w1, w2, w3)
     out_c = fused_mlp_fwd_cutile(x, w1, w2, w3)
-    out_s, _, _ = fused_mlp_fwd_store_acts(x, w1, w2, w3)
+    out_s, _, _ = _fwd_train(x, w1, w2, w3)  # training fwd (STORE_ACTS=1)
     torch.cuda.synchronize()
     ok_t = torch.allclose(out_t, ref, atol=1e-2, rtol=1e-2)
     ok_c = torch.allclose(out_c, ref, atol=1e-2, rtol=1e-2)
@@ -68,7 +67,7 @@ for M in Ms:
     t_pc = do_bench(lambda: pytorch_fwd_compile(x, w1, w2, w3), warmup=25, rep=100) * 1000
     t_t = do_bench(lambda: triton_model(x, w1, w2, w3), warmup=25, rep=100) * 1000
     t_c = do_bench(lambda: fused_mlp_fwd_cutile(x, w1, w2, w3), warmup=25, rep=100) * 1000
-    t_s = do_bench(lambda: fused_mlp_fwd_store_acts(x, w1, w2, w3), warmup=25, rep=100) * 1000
+    t_s = do_bench(lambda: _fwd_train(x, w1, w2, w3), warmup=25, rep=100) * 1000
 
     rows_fwd.append((M, t_p, t_pc, t_t, t_c, t_s, ok_t and ok_c and ok_s))
     print(f"{M:7d} {t_p:9.1f}u {t_pc:9.1f}u {t_t:9.1f}u {t_c:9.1f}u {t_s:9.1f}u {t_p/t_t:5.2f}x {t_p/t_c:5.2f}x {t_p/t_pc:6.2f}x"

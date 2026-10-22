@@ -47,7 +47,7 @@ def softplus_tile(x):
 
 @ct.kernel
 def fused_mlp_kernel(
-    X, W1, W2, W3, OUT,
+    X, W1, W2, W3, OUT, H0, H1PRE,
     M,
     K1: ct.Constant[int], N1: ct.Constant[int], N2: ct.Constant[int], N3: ct.Constant[int],
     TM: ct.Constant[int], TN3: ct.Constant[int],
@@ -57,8 +57,16 @@ def fused_mlp_kernel(
     LATENCY_W2: ct.Constant[int], LATENCY_W3: ct.Constant[int],
     USE_TMA_X: ct.Constant[int], USE_TMA_W1: ct.Constant[int],
     USE_TMA_W2: ct.Constant[int], USE_TMA_W3: ct.Constant[int],
+    STORE_ACTS: ct.Constant[int],
 ):
-    """Persistent kernel: each block processes multiple output tiles round-robin."""
+    """Unified persistent kernel for inference and training.
+
+    STORE_ACTS=0 (inference): compute OUT only — H0/H1PRE stores are compiled
+    out entirely (zero overhead vs the old inference-only kernel).
+
+    STORE_ACTS=1 (training): additionally store pre-activations H0 (M,N1) and
+    H1_PRE (M,N2) in fp32 for the backward pass.
+    """
     raw_pid = ct.bid(0)
     num_pids = ct.num_blocks(0)
 
@@ -87,12 +95,18 @@ def fused_mlp_kernel(
                                       latency=LATENCY_W1, allow_tma=bool(USE_TMA_W1))
                     h1_acc = ct.mma(x_tile, w1_tile, h1_acc)
 
+                if STORE_ACTS and k3 == 0:
+                    ct.store(H0, (pm, k2), h1_acc)  # fp32 pre-activation
+
                 h1_act = softplus_tile(h1_acc)
                 h1_fp16 = ct.astype(h1_act, ct.float16)
 
                 w2_tile = ct.load(W2, (k2, k3), shape=(TK2, TK3),
                                   latency=LATENCY_W2, allow_tma=bool(USE_TMA_W2))
                 h2_acc = ct.mma(h1_fp16, w2_tile, h2_acc)
+
+            if STORE_ACTS:
+                ct.store(H1PRE, (pm, k3), h2_acc)  # fp32 pre-activation
 
             h2_act = softplus_tile(h2_acc)
             h2_fp16 = ct.astype(h2_act, ct.float16)
@@ -270,10 +284,10 @@ def _cfg_from_dict(d):
 _launch_cache: dict = {}
 
 
-def _build_kernel(cfg):
+def _build_kernel(cfg, store_acts=0):
     """Get or create a compiled kernel variant with the given hints (cached)."""
     key = (cfg.occupancy, getattr(cfg, "num_worker_warps", None),
-           getattr(cfg, "num_ctas", 1))
+           getattr(cfg, "num_ctas", 1), store_acts)
     if key not in _kernel_cache:
         hints = _kernel_hints(cfg)
         _kernel_cache[key] = fused_mlp_kernel.replace_hints(**hints)
@@ -289,13 +303,17 @@ def _check_correctness(cfg, x, w1, w2, w3, ref, M, K1, N1, N2, N3):
     stream = torch.cuda.current_stream()
 
     kernel = _build_kernel(cfg)
+    # Dummy fp32 tensors for H0/H1PRE (STORE_ACTS=0: stores are compiled out)
+    h0_dummy = torch.empty(1, device=x.device, dtype=torch.float32)
+    h1_dummy = torch.empty(1, device=x.device, dtype=torch.float32)
     ct.launch(stream, grid, kernel, (
-        x, w1, w2, w3, OUT_test, M,
+        x, w1, w2, w3, OUT_test, h0_dummy, h1_dummy, M,
         K1, N1, N2, N3,
         cfg.TM, cfg.TN3, cfg.TK1, cfg.TK2, cfg.TK3, cfg.GROUP_M,
         cfg.latency_x, cfg.latency_w1, cfg.latency_w2, cfg.latency_w3,
         cfg.use_tma & 1, (cfg.use_tma >> 1) & 1,
         (cfg.use_tma >> 2) & 1, (cfg.use_tma >> 3) & 1,
+        0,  # STORE_ACTS=0
     ))
     torch.cuda.synchronize()
     return torch.allclose(OUT_test, ref, atol=1e-2, rtol=1e-2)
@@ -403,14 +421,18 @@ def _autotune(x, w1, w2, w3, OUT, M, K1, N1, N2, N3):
     h2 = F.softplus(h1 @ w2)
     ref = h2 @ w3
 
+    h0_dummy = torch.empty(1, device=x.device, dtype=torch.float32)
+    h1_dummy = torch.empty(1, device=x.device, dtype=torch.float32)
+
     def _launch_args(cfg, out_tensor):
         return (
-            x, w1, w2, w3, out_tensor, M,
+            x, w1, w2, w3, out_tensor, h0_dummy, h1_dummy, M,
             K1, N1, N2, N3,
             cfg.TM, cfg.TN3, cfg.TK1, cfg.TK2, cfg.TK3, cfg.GROUP_M,
             cfg.latency_x, cfg.latency_w1, cfg.latency_w2, cfg.latency_w3,
             cfg.use_tma & 1, (cfg.use_tma >> 1) & 1,
             (cfg.use_tma >> 2) & 1, (cfg.use_tma >> 3) & 1,
+            0,  # STORE_ACTS=0 during autotune
         )
 
     def _grid_fn(cfg):
@@ -555,8 +577,92 @@ def _autotune(x, w1, w2, w3, OUT, M, K1, N1, N2, N3):
     _build_kernel(best_cfg)
     _tune_cache[cache_key] = best_cfg
     _disk_cache[dk] = _cfg_to_dict(best_cfg)
+
+    # ---- Dual-variant autotune: check if training (STORE_ACTS=1) picks the
+    # same config as inference. Time the training variant with the inference
+    # winner vs a small set of alternatives (larger tiles offset the extra
+    # fp32 store traffic). If a different config wins for training, record it
+    # under a separate cache key; otherwise mark shared.
+    cfg_train = _autotune_train_variant(
+        best_cfg, x, w1, w2, w3, M, K1, N1, N2, N3, cc, num_sms, stream)
+    _disk_cache[dk + "|train"] = _cfg_to_dict(cfg_train)
     _save_disk_cache(_disk_cache)
+    same = all(getattr(cfg_train, k) == getattr(best_cfg, k)
+               for k in ("TM", "TN3", "TK1", "TK2", "TK3", "GROUP_M",
+                         "occupancy", "num_ctas", "num_worker_warps",
+                         "latency_x", "latency_w1", "latency_w2", "latency_w3",
+                         "use_tma"))
+    print(f"  [autotune] train config {'SAME as inference' if same else 'DIFFERS'}")
     return best_cfg
+
+
+def _autotune_train_variant(best_cfg, x, w1, w2, w3, M, K1, N1, N2, N3,
+                            cc, num_sms, stream):
+    """Time STORE_ACTS=1 with the inference winner vs nearby alternatives.
+
+    Returns the config to use for the training forward. The search is small
+    (the training variant differs only by extra fp32 store traffic, which is
+    bandwidth-bound — only tile sizes that change SM occupancy of the
+    persistent loop matter).
+    """
+    H0 = torch.empty((M, N1), device=x.device, dtype=torch.float32)
+    H1PRE = torch.empty((M, N2), device=x.device, dtype=torch.float32)
+    OUT_t = torch.empty((M, N3), device=x.device, dtype=x.dtype)
+
+    def _train_args(cfg):
+        return (
+            x, w1, w2, w3, OUT_t, H0, H1PRE, M,
+            K1, N1, N2, N3,
+            cfg.TM, cfg.TN3, cfg.TK1, cfg.TK2, cfg.TK3, cfg.GROUP_M,
+            cfg.latency_x, cfg.latency_w1, cfg.latency_w2, cfg.latency_w3,
+            cfg.use_tma & 1, (cfg.use_tma >> 1) & 1,
+            (cfg.use_tma >> 2) & 1, (cfg.use_tma >> 3) & 1,
+            1,  # STORE_ACTS=1
+        )
+
+    def _grid_fn(cfg):
+        return (min(num_sms, ct.cdiv(M, cfg.TM) * ct.cdiv(N3, cfg.TN3)),)
+
+    # Candidates: inference winner + neighboring TM/occ/gm
+    candidates = [best_cfg]
+    for tm in (16, 32, 64):
+        if tm == best_cfg.TM:
+            continue
+        c = SimpleNamespace(**vars(best_cfg))
+        c.TM = tm
+        candidates.append(c)
+    for occ in (1, 2):
+        if occ == best_cfg.occupancy:
+            continue
+        c = SimpleNamespace(**vars(best_cfg))
+        c.occupancy = occ
+        candidates.append(c)
+    for gm in (1, 8, 16):
+        if gm == best_cfg.GROUP_M:
+            continue
+        c = SimpleNamespace(**vars(best_cfg))
+        c.GROUP_M = gm
+        candidates.append(c)
+
+    best_us = None
+    winner = best_cfg
+    for cfg in candidates:
+        try:
+            with ct.compiler_timeout(5):
+                result = exhaustive_search(
+                    [cfg], stream, _grid_fn, fused_mlp_kernel,
+                    _train_args, lambda c: _kernel_hints(c),
+                    quiet=True, flush_l2=True,
+                )
+            us = result.successes[0].mean_us if result.successes else float("inf")
+        except Exception:
+            us = float("inf")
+        if best_us is None or us < best_us:
+            best_us = us
+            winner = cfg
+    print(f"  [autotune train] best TM={winner.TM} occ={winner.occupancy} "
+          f"gm={winner.GROUP_M} ({best_us:.1f}us vs inf-winner)")
+    return winner
 
 
 def fused_mlp_fwd_cutile(x, w1, w2, w3):
@@ -616,16 +722,21 @@ def fused_mlp_fwd_cutile(x, w1, w2, w3):
 
     M_c = M
 
+    # Dummy fp32 tensors for H0/H1PRE (STORE_ACTS=0: stores compiled out)
+    h0_dummy = torch.empty(1, device=x.device, dtype=torch.float32)
+    h1_dummy = torch.empty(1, device=x.device, dtype=torch.float32)
+
     # Pre-allocate args list template — only tensor pointers change per call
     _static_args = (
         M_c, K1_c, N1_c, N2_c, N3_c,
         TM_c, TN3_c, TK1_c, TK2_c, TK3_c, GM_c,
         LX_c, LW1_c, LW2_c, LW3_c,
         TX_c, TW1_c, TW2_c, TW3_c,
+        0,  # STORE_ACTS=0
     )
 
     def args_fn(x, w1, w2, w3, out):
-        return (x, w1, w2, w3, out) + _static_args
+        return (x, w1, w2, w3, out, h0_dummy, h1_dummy) + _static_args
 
     def out_alloc():
         return torch.empty((M_c, N3_c), device=x.device, dtype=x.dtype)
@@ -637,71 +748,41 @@ def fused_mlp_fwd_cutile(x, w1, w2, w3):
         "out_alloc": out_alloc,
     }
 
-    # Launch on the first call (OUT was pre-allocated for autotune)
+    # Launch on the first call with a FRESH output tensor — the OUT passed to
+    # _autotune was trial-run on by exhaustive_search and contains garbage.
     stream = torch.cuda.current_stream()
+    OUT = torch.empty((M, N3), device=x.device, dtype=x.dtype)
     ct.launch(stream, grid, kernel, args_fn(x, w1, w2, w3, OUT))
     return OUT
 
 
 # ============================================================
-# Strategy B: forward that stores activations (fp32) for backward
+# Unified entry point: inference (backward=False) and training (backward=True)
 # ============================================================
 
-@ct.kernel
-def fwd_store_acts_kernel(
-    X, W1, W2, W3, OUT, H0, H1PRE,
-    M,
-    K1: ct.Constant[int], N1: ct.Constant[int], N2: ct.Constant[int], N3: ct.Constant[int],
-    TM: ct.Constant[int], TN3: ct.Constant[int],
-    TK1: ct.Constant[int], TK2: ct.Constant[int], TK3: ct.Constant[int],
-):
-    """Forward megakernel that also stores H0=(X@W1) pre-activation (M,N1) and
-    H1_PRE=(softplus(H0)@W2) pre-activation (M,N2), both in fp32."""
-    raw_pid = ct.bid(0)
-    num_pids = ct.num_blocks(0)
+class FusedMLPCutile(torch.autograd.Function):
+    """Training path: forward stores fp32 activations (STORE_ACTS=1),
+    backward is ONE fused megakernel launch (strategy B)."""
 
-    num_m = ct.cdiv(M, TM)
-    num_n3 = ct.cdiv(N3, TN3)
-    num_tiles = num_m * num_n3
+    @staticmethod
+    def forward(ctx, x, w1, w2, w3):
+        out, H0, H1PRE = _fwd_train(x, w1, w2, w3)
+        ctx.save_for_backward(x, w1, w2, w3, H0, H1PRE)
+        return out
 
-    for tile_id in range(raw_pid, num_tiles, num_pids):
-        pm = tile_id % num_m
-        pn3 = tile_id // num_m
-
-        out_acc = ct.zeros((TM, TN3), ct.float32)
-
-        for k3 in range(ct.cdiv(N2, TK3)):
-            h2_acc = ct.zeros((TM, TK3), ct.float32)
-
-            for k2 in range(ct.cdiv(N1, TK2)):
-                h1_acc = ct.zeros((TM, TK2), ct.float32)
-
-                for k1 in range(ct.cdiv(K1, TK1)):
-                    x_tile = ct.load(X, (pm, k1), shape=(TM, TK1), latency=4)
-                    w1_tile = ct.load(W1, (k1, k2), shape=(TK1, TK2), latency=4)
-                    h1_acc = ct.mma(x_tile, w1_tile, h1_acc)
-
-                if (k3 == 0):
-                    ct.store(H0, (pm, k2), h1_acc)  # fp32 pre-activation
-
-                h1_act = softplus_tile(h1_acc)
-                h1_fp16 = ct.astype(h1_act, ct.float16)
-
-                w2_tile = ct.load(W2, (k2, k3), shape=(TK2, TK3), latency=4)
-                h2_acc = ct.mma(h1_fp16, w2_tile, h2_acc)
-
-            ct.store(H1PRE, (pm, k3), h2_acc)  # fp32 pre-activation
-            h2_act = softplus_tile(h2_acc)
-            h2_fp16 = ct.astype(h2_act, ct.float16)
-
-            w3_tile = ct.load(W3, (k3, pn3), shape=(TK3, TN3), latency=4)
-            out_acc = ct.mma(h2_fp16, w3_tile, out_acc)
-
-        ct.store(OUT, (pm, pn3), ct.astype(out_acc, ct.float16))
+    @staticmethod
+    def backward(ctx, dout):
+        x, w1, w2, w3, H0, H1PRE = ctx.saved_tensors
+        dx, dw1, dw2, dw3 = fused_mlp_bwd_cutile(dout, x, w1, w2, w3, H0, H1PRE)
+        return dx, dw1, dw2, dw3
 
 
-def fused_mlp_fwd_store_acts(x, w1, w2, w3):
-    """Forward that stores pre-activations H0 (M,N1) and H1_PRE (M,N2) fp32."""
+def _fwd_train(x, w1, w2, w3):
+    """Training forward: unified kernel, STORE_ACTS=1, autotuned config.
+
+    Uses the same autotuned config as inference when available (the configs
+    are autotuned per variant; when they match, the variants share the entry).
+    """
     M, K1 = x.shape
     N1 = w1.shape[1]
     N2 = w2.shape[1]
@@ -716,22 +797,69 @@ def fused_mlp_fwd_store_acts(x, w1, w2, w3):
     H0 = torch.empty((M, N1), device=x.device, dtype=torch.float32)
     H1PRE = torch.empty((M, N2), device=x.device, dtype=torch.float32)
 
-    TM = 32 if M >= 32 else 16
-    TN3 = min(128, N3)
-    TK1 = min(64, K1)
-    TK2 = min(128, N1)
-    TK3 = min(128, N2)
+    # Autotune inference config (also triggers train-variant tuning on first call)
+    _autotune(x, w1, w2, w3, OUT, M, K1, N1, N2, N3)
+
+    # Use the training-specific config if the dual-variant autotune found a
+    # different winner; otherwise fall back to the inference config.
+    cc = torch.cuda.get_device_capability()
+    dk = _disk_key((cc[0], cc[1], M, K1, N1, N2, N3))
+    train_dk = dk + "|train"
+    if train_dk in _disk_cache:
+        cfg = _cfg_from_dict(_disk_cache[train_dk])
+    else:
+        cfg = _tune_cache[(cc[0], cc[1], M, K1, N1, N2, N3)]
+    kernel = _build_kernel(cfg, store_acts=1)
 
     num_sms = _get_num_sms()
-    num_tiles = (M + TM - 1) // TM * ((N3 + TN3 - 1) // TN3)
+    num_tiles = (M + cfg.TM - 1) // cfg.TM * ((N3 + cfg.TN3 - 1) // cfg.TN3)
     grid = (min(num_sms, num_tiles),)
     stream = torch.cuda.current_stream()
 
-    ct.launch(stream, grid, fwd_store_acts_kernel, (
+    ct.launch(stream, grid, kernel, (
         x, w1, w2, w3, OUT, H0, H1PRE, M,
-        K1, N1, N2, N3, TM, TN3, TK1, TK2, TK3,
+        K1, N1, N2, N3,
+        cfg.TM, cfg.TN3, cfg.TK1, cfg.TK2, cfg.TK3, cfg.GROUP_M,
+        cfg.latency_x, cfg.latency_w1, cfg.latency_w2, cfg.latency_w3,
+        cfg.use_tma & 1, (cfg.use_tma >> 1) & 1,
+        (cfg.use_tma >> 2) & 1, (cfg.use_tma >> 3) & 1,
+        1,  # STORE_ACTS=1
     ))
     return OUT, H0, H1PRE
+
+
+def fused_mlp(x, w1, w2, w3, backward=False, save_acts_path=None):
+    """Single entry point for the fused cuTile MLP.
+
+    backward=False (inference): autotuned forward, no activation storage.
+    backward=True  (training):  forward stores fp32 H0/H1_PRE and wires the
+                                fused backward via autograd.
+    save_acts_path:  optional .pt path — with backward=True, also dumps the
+                     intermediate activations (H0, H1_PRE, OUT) to disk.
+    """
+    if not backward:
+        return fused_mlp_fwd_cutile(x, w1, w2, w3)
+
+    out = FusedMLPCutile.apply(x, w1, w2, w3)
+
+    if save_acts_path is not None:
+        # Grab the activations saved on the autograd node
+        ctx = out.grad_fn
+        _x, _w1, _w2, _w3, H0, H1PRE = ctx.saved_tensors
+        torch.save({"OUT": out.detach(), "H0": H0, "H1_PRE": H1PRE},
+                   save_acts_path)
+    return out
+
+
+# Back-compat aliases
+def fused_mlp_fwd_store_acts(x, w1, w2, w3):
+    """Training forward (STORE_ACTS=1). Prefer fused_mlp(..., backward=True)."""
+    return _fwd_train(x, w1, w2, w3)
+
+
+def fused_mlp_cutile(x, w1, w2, w3):
+    """Training path via autograd.Function. Prefer fused_mlp(..., backward=True)."""
+    return FusedMLPCutile.apply(x, w1, w2, w3)
 
 
 # ============================================================
@@ -1073,28 +1201,6 @@ def fused_mlp_bwd_cutile(dout, x, w1, w2, w3, H0=None, H1PRE=None):
 
     return (dx32.to(x.dtype), dw1_32.to(x.dtype),
             dw2_32.to(x.dtype), dw3_32.to(x.dtype))
-
-
-class FusedMLPCutile(torch.autograd.Function):
-    """Fused cuTile MLP (strategy B): fwd stores fp32 activations,
-    backward is ONE fused megakernel launch."""
-
-    @staticmethod
-    def forward(ctx, x, w1, w2, w3):
-        out, H0, H1PRE = fused_mlp_fwd_store_acts(x, w1, w2, w3)
-        ctx.save_for_backward(x, w1, w2, w3, H0, H1PRE)
-        return out
-
-    @staticmethod
-    def backward(ctx, dout):
-        x, w1, w2, w3, H0, H1PRE = ctx.saved_tensors
-        dx, dw1, dw2, dw3 = fused_mlp_bwd_cutile(dout, x, w1, w2, w3, H0, H1PRE)
-        return dx, dw1, dw2, dw3
-
-
-def fused_mlp_cutile(x, w1, w2, w3):
-    """Convenience wrapper: fused forward + backward via autograd.Function."""
-    return FusedMLPCutile.apply(x, w1, w2, w3)
 
 
 if __name__ == "__main__":
