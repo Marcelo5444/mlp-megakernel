@@ -97,8 +97,10 @@ for M in Ms:
     x.grad = None; w1.grad = None; w2.grad = None; w3.grad = None
     out_ct = fused_mlp_cutile(x, w1, w2, w3)
     out_ct.sum().backward()
-    ok_dx = F.cosine_similarity(ref_dx.flatten(), x.grad.flatten(), dim=0).item() >= 0.99
-    ok_dw1 = F.cosine_similarity(ref_dw1.flatten(), w1.grad.flatten(), dim=0).item() >= 0.99
+    # fp16 accumulates ~65K entries in fp16 dot products -> inf/precision
+    # loss; compute cosine in fp32 (same as bench_splitk.py).
+    ok_dx = F.cosine_similarity(ref_dx.flatten().float(), x.grad.flatten().float(), dim=0).item() >= 0.99
+    ok_dw1 = F.cosine_similarity(ref_dw1.flatten().float(), w1.grad.flatten().float(), dim=0).item() >= 0.99
 
     # Now benchmark (fresh tensors to avoid graph pollution)
     x = torch.randn(M, D, dtype=torch.float16, device='cuda') * 0.02
