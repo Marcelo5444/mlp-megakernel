@@ -1279,7 +1279,9 @@ if __name__ == "__main__":
 
     def check(name, got, ref):
         diff = (got - ref).abs().max().item()
-        cos = F.cosine_similarity(ref.flatten(), got.flatten(), dim=0).item()
+        # Cosine in fp32 to avoid overflow on large-gradient tensors (dW3 can
+        # reach ~365K at M=4096, overflowing fp16 in the dot product).
+        cos = F.cosine_similarity(ref.flatten().float(), got.flatten().float(), dim=0).item()
         ok = cos >= 0.99
         print(f"  {name}: diff={diff:.6f} cos={cos:.6f} {'PASS' if ok else 'FAIL'}")
         return ok
