@@ -26,6 +26,7 @@ from cuda.tile import ByTarget
 from cuda.tile.tune import exhaustive_search
 
 _NUM_SMS = None
+_BWD_FUSED_K8 = None  # cached nww=8/occ=1 variant of bwd_fused_kernel
 
 
 def _get_num_sms():
@@ -643,6 +644,97 @@ def fused_mlp_fwd_cutile(x, w1, w2, w3):
 
 
 # ============================================================
+# Strategy B: forward that stores activations (fp32) for backward
+# ============================================================
+
+@ct.kernel
+def fwd_store_acts_kernel(
+    X, W1, W2, W3, OUT, H0, H1PRE,
+    M,
+    K1: ct.Constant[int], N1: ct.Constant[int], N2: ct.Constant[int], N3: ct.Constant[int],
+    TM: ct.Constant[int], TN3: ct.Constant[int],
+    TK1: ct.Constant[int], TK2: ct.Constant[int], TK3: ct.Constant[int],
+):
+    """Forward megakernel that also stores H0=(X@W1) pre-activation (M,N1) and
+    H1_PRE=(softplus(H0)@W2) pre-activation (M,N2), both in fp32."""
+    raw_pid = ct.bid(0)
+    num_pids = ct.num_blocks(0)
+
+    num_m = ct.cdiv(M, TM)
+    num_n3 = ct.cdiv(N3, TN3)
+    num_tiles = num_m * num_n3
+
+    for tile_id in range(raw_pid, num_tiles, num_pids):
+        pm = tile_id % num_m
+        pn3 = tile_id // num_m
+
+        out_acc = ct.zeros((TM, TN3), ct.float32)
+
+        for k3 in range(ct.cdiv(N2, TK3)):
+            h2_acc = ct.zeros((TM, TK3), ct.float32)
+
+            for k2 in range(ct.cdiv(N1, TK2)):
+                h1_acc = ct.zeros((TM, TK2), ct.float32)
+
+                for k1 in range(ct.cdiv(K1, TK1)):
+                    x_tile = ct.load(X, (pm, k1), shape=(TM, TK1), latency=4)
+                    w1_tile = ct.load(W1, (k1, k2), shape=(TK1, TK2), latency=4)
+                    h1_acc = ct.mma(x_tile, w1_tile, h1_acc)
+
+                if (k3 == 0):
+                    ct.store(H0, (pm, k2), h1_acc)  # fp32 pre-activation
+
+                h1_act = softplus_tile(h1_acc)
+                h1_fp16 = ct.astype(h1_act, ct.float16)
+
+                w2_tile = ct.load(W2, (k2, k3), shape=(TK2, TK3), latency=4)
+                h2_acc = ct.mma(h1_fp16, w2_tile, h2_acc)
+
+            ct.store(H1PRE, (pm, k3), h2_acc)  # fp32 pre-activation
+            h2_act = softplus_tile(h2_acc)
+            h2_fp16 = ct.astype(h2_act, ct.float16)
+
+            w3_tile = ct.load(W3, (k3, pn3), shape=(TK3, TN3), latency=4)
+            out_acc = ct.mma(h2_fp16, w3_tile, out_acc)
+
+        ct.store(OUT, (pm, pn3), ct.astype(out_acc, ct.float16))
+
+
+def fused_mlp_fwd_store_acts(x, w1, w2, w3):
+    """Forward that stores pre-activations H0 (M,N1) and H1_PRE (M,N2) fp32."""
+    M, K1 = x.shape
+    N1 = w1.shape[1]
+    N2 = w2.shape[1]
+    N3 = w3.shape[1]
+
+    x = x.contiguous()
+    w1 = w1.contiguous()
+    w2 = w2.contiguous()
+    w3 = w3.contiguous()
+
+    OUT = torch.empty((M, N3), device=x.device, dtype=x.dtype)
+    H0 = torch.empty((M, N1), device=x.device, dtype=torch.float32)
+    H1PRE = torch.empty((M, N2), device=x.device, dtype=torch.float32)
+
+    TM = 32 if M >= 32 else 16
+    TN3 = min(128, N3)
+    TK1 = min(64, K1)
+    TK2 = min(128, N1)
+    TK3 = min(128, N2)
+
+    num_sms = _get_num_sms()
+    num_tiles = (M + TM - 1) // TM * ((N3 + TN3 - 1) // TN3)
+    grid = (min(num_sms, num_tiles),)
+    stream = torch.cuda.current_stream()
+
+    ct.launch(stream, grid, fwd_store_acts_kernel, (
+        x, w1, w2, w3, OUT, H0, H1PRE, M,
+        K1, N1, N2, N3, TM, TN3, TK1, TK2, TK3,
+    ))
+    return OUT, H0, H1PRE
+
+
+# ============================================================
 # Backward kernels (fused, atomic weight-grad accumulation)
 # ============================================================
 
@@ -831,21 +923,129 @@ def bwd_wgrad1_kernel(
         ct.atomic_add(DW1, (row_idx, col_idx), dw1_acc)
 
 
-def fused_mlp_bwd_cutile(dout, x, w1, w2, w3):
-    """Fused backward: returns (dx, dW1, dW2, dW3)."""
+@ct.kernel
+def bwd_fused_kernel(
+    X, W1, W2, W3, DOUT, H0, H1PRE, DX, DW1, DW2, DW3,
+    M,
+    K1: ct.Constant[int], N1: ct.Constant[int], N2: ct.Constant[int], N3: ct.Constant[int],
+    TM: ct.Constant[int], TK1: ct.Constant[int], TN: ct.Constant[int],
+):
+    """ONE fused backward megakernel (strategy B).
+
+    Contract: K1 = N1 = N2 = N3 = TN (one square weight tile per weight), and
+    K1 % TK1 == 0. Activations are loaded from global fp32 H0 (M,N1) /
+    H1_PRE (M,N2) stored by fwd_store_acts_kernel — NO recompute.
+
+    Per M-tile pm (persistent round-robin):
+      Phase A (input grads):
+        dh1[m, :] = (dout @ W3^T) * sigmoid(H1_PRE)
+        dh2[m, :] = (dh1 @ W2^T) * sigmoid(H0)
+        dx[m, k1]  = dh2 @ W1^T           (atomic_add, fp32)
+      Phase B (weight grads, accumulators held across all pm of this block):
+        dW3 += softplus(H1_PRE)^T @ dout
+        dW2 += softplus(H0)^T     @ dh1
+        dW1 += X^T                @ dh2
+    Weight-grad accumulators are flushed with one atomic_add at kernel end.
+    """
+    raw_pid = ct.bid(0)
+    num_pids = ct.num_blocks(0)
+    num_m = ct.cdiv(M, TM)
+    num_n3 = ct.cdiv(N3, TN)
+    num_k1 = ct.cdiv(K1, TK1)
+
+    # Full weight-grad accumulators (held across all pm tiles of this block):
+    # dW3 (N2,N3), dW2 (N1,N2), dW1 (K1,N1) — exactly (TN,TN) / (TN,TN) /
+    # (TK1 * num_k1, TN) == (K1, TN) when K1=TN=TK1.
+    dw3_acc = ct.zeros((TN, TN), ct.float32)
+    dw2_acc = ct.zeros((TN, TN), ct.float32)
+    dw1_acc = ct.zeros((TK1, TN), ct.float32)
+
+    for pm in range(raw_pid, num_m, num_pids):
+        # ---- dh1 = (dout @ W3^T) * sigmoid(H1_PRE) ----
+        dh1_acc = ct.zeros((TM, TN), ct.float32)
+        for k3 in range(num_n3):
+            dout_t = ct.load(DOUT, (pm, k3), shape=(TM, TN), latency=4)
+            w3_t = ct.load(W3, (0, k3), shape=(TN, TN), latency=4)
+            w3_t = ct.transpose(w3_t)
+            dh1_acc = ct.mma(dout_t, w3_t, dh1_acc)
+        h1pre_t = ct.load(H1PRE, (pm, 0), shape=(TM, TN), latency=4)
+        dh1 = dh1_acc * softplus_grad_tile(h1pre_t)   # fp32
+        dh1_f16 = ct.astype(dh1, ct.float16)
+
+        # ---- dW3 += softplus(H1_PRE)^T @ dout ----
+        h1 = softplus_tile(h1pre_t)
+        h1_f16 = ct.astype(h1, ct.float16)
+        h1_t = ct.transpose(h1_f16)
+        for pn3 in range(num_n3):
+            dout_t = ct.load(DOUT, (pm, pn3), shape=(TM, TN), latency=4)
+            dw3_acc = ct.mma(h1_t, dout_t, dw3_acc)
+
+        # ---- dh2 = (dh1 @ W2^T) * sigmoid(H0) ----
+        w2_t = ct.load(W2, (0, 0), shape=(TN, TN), latency=4)
+        w2_t = ct.transpose(w2_t)
+        dh2_acc = ct.zeros((TM, TN), ct.float32)
+        dh2_acc = ct.mma(dh1_f16, w2_t, dh2_acc)
+        h0_t = ct.load(H0, (pm, 0), shape=(TM, TN), latency=4)
+        dh2 = dh2_acc * softplus_grad_tile(h0_t)      # fp32
+        dh2_f16 = ct.astype(dh2, ct.float16)
+
+        # ---- dW2 += softplus(H0)^T @ dh1 ----
+        h0 = softplus_tile(h0_t)
+        h0_f16 = ct.astype(h0, ct.float16)
+        h0_t = ct.transpose(h0_f16)
+        dw2_acc = ct.mma(h0_t, dh1_f16, dw2_acc)
+
+        # ---- dW1 += X^T @ dh2 / dx = dh2 @ W1^T (TK1 chunks over K1) ----
+        for k1t in range(num_k1):
+            x_t = ct.load(X, (pm, k1t), shape=(TM, TK1), latency=4)
+            x_tT = ct.transpose(x_t)
+            dw1_acc = ct.mma(x_tT, dh2_f16, dw1_acc)
+
+            dx_acc = ct.zeros((TM, TK1), ct.float32)
+            w1_t = ct.load(W1, (k1t, 0), shape=(TK1, TN), latency=4)
+            w1_t = ct.transpose(w1_t)
+            dx_acc = ct.mma(dh2_f16, w1_t, dx_acc)
+            # dx[pm, k1t]: each row tile is written by exactly one block
+            # (pm tiles are partitioned round-robin), so a plain store works.
+            ct.store(DX, (pm, k1t), dx_acc)
+
+    # ---- flush weight grads (atomic_add, fp32) ----
+    rows = ct.arange(TN, dtype=ct.int32)
+    cols = ct.arange(TN, dtype=ct.int32)
+    row_idx = ct.reshape(rows, (TN, 1))
+    col_idx = ct.reshape(cols, (1, TN))
+    ct.atomic_add(DW3, (row_idx, col_idx), dw3_acc)
+    ct.atomic_add(DW2, (row_idx, col_idx), dw2_acc)
+
+    rows1 = ct.arange(TK1, dtype=ct.int32)
+    row_idx1 = ct.reshape(rows1, (TK1, 1))
+    ct.atomic_add(DW1, (row_idx1, col_idx), dw1_acc)
+
+
+def fused_mlp_bwd_cutile(dout, x, w1, w2, w3, H0=None, H1PRE=None):
+    """Strategy B backward: ONE fused kernel launch. Returns (dx, dW1, dW2, dW3).
+
+    Requires H0/H1_PRE fp32 activations from fused_mlp_fwd_store_acts.
+    Contract: K1 == N1 == N2 == N3 (single-tile square weights).
+    """
+    assert H0 is not None and H1PRE is not None, \
+        "strategy B needs stored activations H0/H1_PRE"
     M, K1 = x.shape
     N1 = w1.shape[1]
     N2 = w2.shape[1]
     N3 = w3.shape[1]
+    assert K1 == N1 == N2 == N3, \
+        f"bwd_fused_kernel requires square dims, got {K1},{N1},{N2},{N3}"
 
     dout = dout.contiguous()
     x = x.contiguous()
     w1 = w1.contiguous()
     w2 = w2.contiguous()
     w3 = w3.contiguous()
+    H0 = H0.contiguous()
+    H1PRE = H1PRE.contiguous()
 
     dx32 = torch.zeros((M, K1), device=x.device, dtype=torch.float32)
-    dh1 = torch.empty((M, N2), device=x.device, dtype=x.dtype)
     dw1_32 = torch.zeros((K1, N1), device=x.device, dtype=torch.float32)
     dw2_32 = torch.zeros((N1, N2), device=x.device, dtype=torch.float32)
     dw3_32 = torch.zeros((N2, N3), device=x.device, dtype=torch.float32)
@@ -853,27 +1053,22 @@ def fused_mlp_bwd_cutile(dout, x, w1, w2, w3):
     stream = torch.cuda.current_stream()
     num_sms = _get_num_sms()
 
-    TM = 64 if M >= 64 else 16
-    TK1 = min(64, K1)
-    TK2 = min(128, N1)
-    TK3 = min(128, N2)
+    TM = 16 if M >= 16 else _next_pow2(M)  # TM=16 wins across M on GB10
+    TN = K1  # single square tile per weight (dims 128 in this repo)
+    TK1 = TN
     grid = (min(num_sms, (M + TM - 1) // TM),)
-    ct.launch(stream, grid, bwd_dgrad_kernel, (
-        x, w1, w2, w3, dout, dh1, dx32, M,
-        K1, N1, N2, N3, TM, TK1, TK2, TK3,
-    ))
 
-    grid_w3 = (min(num_sms, (N2 + TK3 - 1) // TK3 * ((N3 + TK3 - 1) // TK3)),)
-    ct.launch(stream, grid_w3, bwd_wgrad3_kernel, (
-        x, w1, w2, w3, dout, dw3_32, M, K1, N1, N2, N3, TM, TK1, TK2, TK3,
-    ))
-    grid_w2 = (min(num_sms, (N1 + TK2 - 1) // TK2 * ((N2 + TK2 - 1) // TK2)),)
-    ct.launch(stream, grid_w2, bwd_wgrad2_kernel, (
-        x, w1, dh1, dw2_32, M, K1, N1, N2, TM, TK1, TK2,
-    ))
-    grid_w1 = (min(num_sms, (K1 + TK1 - 1) // TK1 * ((N1 + TK2 - 1) // TK2)),)
-    ct.launch(stream, grid_w1, bwd_wgrad1_kernel, (
-        x, w1, dh1, w2, dw1_32, M, K1, N1, N2, TM, TK1, TK2,
+    # nww=8 + occ=1: 2-3x faster than default hints on GB10 (sweep in tune2.py)
+    global _BWD_FUSED_K8
+    if _BWD_FUSED_K8 is None:
+        _BWD_FUSED_K8 = bwd_fused_kernel.replace_hints(occupancy=1,
+                                                       num_worker_warps=8)
+    kernel = _BWD_FUSED_K8
+
+    # ONE launch: dh1, dh2, dx, dW1, dW2, dW3
+    ct.launch(stream, grid, kernel, (
+        x, w1, w2, w3, dout, H0, H1PRE, dx32, dw1_32, dw2_32, dw3_32, M,
+        K1, N1, N2, N3, TM, TK1, TN,
     ))
 
     return (dx32.to(x.dtype), dw1_32.to(x.dtype),
@@ -881,17 +1076,19 @@ def fused_mlp_bwd_cutile(dout, x, w1, w2, w3):
 
 
 class FusedMLPCutile(torch.autograd.Function):
-    """Fused cuTile MLP: forward + backward in custom autograd Function."""
+    """Fused cuTile MLP (strategy B): fwd stores fp32 activations,
+    backward is ONE fused megakernel launch."""
 
     @staticmethod
     def forward(ctx, x, w1, w2, w3):
-        ctx.save_for_backward(x, w1, w2, w3)
-        return fused_mlp_fwd_cutile(x, w1, w2, w3)
+        out, H0, H1PRE = fused_mlp_fwd_store_acts(x, w1, w2, w3)
+        ctx.save_for_backward(x, w1, w2, w3, H0, H1PRE)
+        return out
 
     @staticmethod
     def backward(ctx, dout):
-        x, w1, w2, w3 = ctx.saved_tensors
-        dx, dw1, dw2, dw3 = fused_mlp_bwd_cutile(dout, x, w1, w2, w3)
+        x, w1, w2, w3, H0, H1PRE = ctx.saved_tensors
+        dx, dw1, dw2, dw3 = fused_mlp_bwd_cutile(dout, x, w1, w2, w3, H0, H1PRE)
         return dx, dw1, dw2, dw3
 
 
