@@ -26,8 +26,6 @@ from cuda.tile import ByTarget
 from cuda.tile.tune import exhaustive_search
 
 _NUM_SMS = None
-_BWD_FUSED_K8 = None  # cached nww=8/occ=1 variant of bwd_fused_kernel
-_BWD_FUSED_VARIANTS = {}  # (occ, nww, nctas) -> replace_hints'd kernel
 
 # Tuned backward configs (GB10 sm_121, exhaustive_search per M; see tune_bwd_hints.py)
 _BWD_TUNED = {
@@ -784,10 +782,7 @@ class FusedMLPCutile(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout):
         x, w1, w2, w3, H0, H1PRE = ctx.saved_tensors
-        if w1.shape[0] == w1.shape[1] == w2.shape[1] == w3.shape[1] == 128:
-            dx, dw1, dw2, dw3 = fused_mlp_bwd_splitk(dout, x, w1, w2, w3, H0, H1PRE)
-        else:
-            dx, dw1, dw2, dw3 = fused_mlp_bwd_cutile(dout, x, w1, w2, w3, H0, H1PRE)
+        dx, dw1, dw2, dw3 = fused_mlp_bwd_splitk(dout, x, w1, w2, w3, H0, H1PRE)
         return dx, dw1, dw2, dw3
 
 
@@ -880,192 +875,41 @@ def fused_mlp_cutile(x, w1, w2, w3):
 
 
 # ============================================================
-# Backward kernels (fused, atomic weight-grad accumulation)
+# Backward: split-K design (dgrad + split-K wgrads + reduce)
 # ============================================================
+#
+# TESTED AND REJECTED (documented for posterity):
+#
+# 1. RECOMPUTE backward (original): recompute forward activations in the
+#    backward kernel instead of storing them. 4 kernels (dgrad + wgrad1/2/3).
+#    Result: ~10x slower than PyTorch eager at all M (1552us vs 131us at
+#    M=4096). Removed — the recompute FLOPs dominate.
+#
+# 2. FUSED megakernel (strategy B): ONE kernel computing dh1, dh2, dx,
+#    dW1, dW2, dW3 with fp32 register accumulators + atomic_add flush.
+#    Result: 6.3x faster than recompute (245us at M=4096), but split-K
+#    beats it at small M (0.52x at M=256) and matches at large M.
+#    Also uses 3x 128x128 fp32 accumulators in registers — occupancy-limited
+#    on GB10 (48 SMs). Removed in favor of split-K.
+#
+# 3. SEPARATE fwd kernel for activation storage: a second fwd_store_acts
+#    kernel (TM=32 hardcoded) that wrote H0/H1PRE fp32. Result: unified
+#    into fused_mlp_kernel with STORE_ACTS constexpr — one kernel source,
+#    two compiled variants. The separate kernel was not autotuned and used
+#    stale tile sizes.
+#
+# ACTIVE DESIGN (split-K):
+#   - dgrad kernel: dh1/dh2/dx per M-tile + per-block dW1 partial (rides
+#     along nearly free since x and dh2 are already in registers)
+#   - 2 split-K wgrad kernels: dW2 (softplus(H0)^T @ dh1), dW3 (softplus(H1_PRE)^T @ dout)
+#     with A-operand recomputed from fp16 pre-acts as sigmoid(pre)*softplus(pre)
+#   - Deterministic tiled reduction: sums per-block partials (no atomics)
+#   - Activations stored fp16 (halves traffic vs fp32, cosine >= 0.997 vs eager)
 
 def softplus_grad_tile(x):
     """sigmoid(x) = where(x > 20, 1, exp(x)/(1+exp(x)))."""
     ex = ct.exp(x)
     return ct.where(x > 20.0, 1.0, ex / (1.0 + ex))
-
-
-@ct.kernel
-def bwd_dgrad_kernel(
-    X, W1, W2, W3, DOUT, DH1, DX,
-    M,
-    K1: ct.Constant[int], N1: ct.Constant[int], N2: ct.Constant[int], N3: ct.Constant[int],
-    TM: ct.Constant[int], TK1: ct.Constant[int], TK2: ct.Constant[int], TK3: ct.Constant[int],
-):
-    """Persistent kernel: for each M-tile, compute dh1, dh2, dx."""
-    raw_pid = ct.bid(0)
-    num_pids = ct.num_blocks(0)
-    num_m = ct.cdiv(M, TM)
-
-    for pm in range(raw_pid, num_m, num_pids):
-        # ---- Stage 1: dh1 = (dout @ W3^T) * sigmoid(h1) ----
-        for k2 in range(ct.cdiv(N2, TK2)):
-            dh1_acc = ct.zeros((TM, TK2), ct.float32)
-            h1_acc = ct.zeros((TM, TK2), ct.float32)
-            for k1 in range(ct.cdiv(K1, TK1)):
-                x_t = ct.load(X, (pm, k1), shape=(TM, TK1), latency=4)
-                w1_t = ct.load(W1, (k1, k2), shape=(TK1, TK2), latency=4)
-                h1_acc = ct.mma(x_t, w1_t, h1_acc)
-            for k3 in range(ct.cdiv(N3, TK3)):
-                dout_t = ct.load(DOUT, (pm, k3), shape=(TM, TK3), latency=4)
-                w3_t = ct.load(W3, (k2, k3), shape=(TK2, TK3), latency=4)
-                w3_t = ct.transpose(w3_t)
-                dh1_acc = ct.mma(dout_t, w3_t, dh1_acc)
-            dh1 = dh1_acc * softplus_grad_tile(h1_acc)
-            ct.store(DH1, (pm, k2), ct.astype(dh1, ct.float16))
-
-        # ---- Stage 2: dx = dh2 @ W1^T where dh2 = (dh1 @ W2^T) * sigmoid(h0) ----
-        for k2 in range(ct.cdiv(N1, TK2)):
-            h0_acc = ct.zeros((TM, TK2), ct.float32)
-            for kk in range(ct.cdiv(K1, TK1)):
-                x_t = ct.load(X, (pm, kk), shape=(TM, TK1), latency=4)
-                w1_t = ct.load(W1, (kk, k2), shape=(TK1, TK2), latency=4)
-                h0_acc = ct.mma(x_t, w1_t, h0_acc)
-            dh2_acc = ct.zeros((TM, TK2), ct.float32)
-            for k2p in range(ct.cdiv(N2, TK2)):
-                dh1_t = ct.load(DH1, (pm, k2p), shape=(TM, TK2), latency=4)
-                w2_t = ct.load(W2, (k2, k2p), shape=(TK2, TK2), latency=4)
-                w2_t = ct.transpose(w2_t)
-                dh2_acc = ct.mma(dh1_t, w2_t, dh2_acc)
-            dh2 = dh2_acc * softplus_grad_tile(h0_acc)
-            dh2_f16 = ct.astype(dh2, ct.float16)
-            for k1 in range(ct.cdiv(K1, TK1)):
-                w1_t = ct.load(W1, (k1, k2), shape=(TK1, TK2), latency=4)
-                w1_t = ct.transpose(w1_t)
-                dx_acc = ct.zeros((TM, TK1), ct.float32)
-                dx_acc = ct.mma(dh2_f16, w1_t, dx_acc)
-                rows = ct.arange(TM, dtype=ct.int32) + pm * TM
-                cols = ct.arange(TK1, dtype=ct.int32) + k1 * TK1
-                row_idx = ct.reshape(rows, (TM, 1))
-                col_idx = ct.reshape(cols, (1, TK1))
-                ct.atomic_add(DX, (row_idx, col_idx), dx_acc)
-
-
-@ct.kernel
-def bwd_wgrad3_kernel(
-    X, W1, W2, W3, DOUT, DW3,
-    M,
-    K1: ct.Constant[int], N1: ct.Constant[int], N2: ct.Constant[int], N3: ct.Constant[int],
-    TM: ct.Constant[int], TK1: ct.Constant[int], TK2: ct.Constant[int], TK3: ct.Constant[int],
-):
-    """dW3 = H2^T @ dout, accumulated atomically over M-tiles."""
-    raw_pid = ct.bid(0)
-    num_pids = ct.num_blocks(0)
-    num_k3 = ct.cdiv(N2, TK3)
-    num_n3 = ct.cdiv(N3, TK3)
-    num_m = ct.cdiv(M, TM)
-    num_tiles = num_k3 * num_n3
-
-    for tile_id in range(raw_pid, num_tiles, num_pids):
-        pk3 = tile_id % num_k3
-        pn3 = tile_id // num_k3
-        dw3_acc = ct.zeros((TK3, TK3), ct.float32)
-        for pm in range(num_m):
-            h2_acc = ct.zeros((TM, TK3), ct.float32)
-            for k2 in range(ct.cdiv(N1, TK2)):
-                h1_acc = ct.zeros((TM, TK2), ct.float32)
-                for k1 in range(ct.cdiv(K1, TK1)):
-                    x_t = ct.load(X, (pm, k1), shape=(TM, TK1), latency=4)
-                    w1_t = ct.load(W1, (k1, k2), shape=(TK1, TK2), latency=4)
-                    h1_acc = ct.mma(x_t, w1_t, h1_acc)
-                h1 = softplus_tile(h1_acc)
-                h1_f16 = ct.astype(h1, ct.float16)
-                w2_t = ct.load(W2, (k2, pk3), shape=(TK2, TK3), latency=4)
-                h2_acc = ct.mma(h1_f16, w2_t, h2_acc)
-            h2 = softplus_tile(h2_acc)
-            h2_f16 = ct.astype(h2, ct.float16)
-            h2_t = ct.transpose(h2_f16)
-            dout_t = ct.load(DOUT, (pm, pn3), shape=(TM, TK3), latency=4)
-            dw3_acc = ct.mma(h2_t, dout_t, dw3_acc)
-        rows = ct.arange(TK3, dtype=ct.int32) + pk3 * TK3
-        cols = ct.arange(TK3, dtype=ct.int32) + pn3 * TK3
-        row_idx = ct.reshape(rows, (TK3, 1))
-        col_idx = ct.reshape(cols, (1, TK3))
-        ct.atomic_add(DW3, (row_idx, col_idx), dw3_acc)
-
-
-@ct.kernel
-def bwd_wgrad2_kernel(
-    X, W1, DH1, DW2,
-    M,
-    K1: ct.Constant[int], N1: ct.Constant[int], N2: ct.Constant[int],
-    TM: ct.Constant[int], TK1: ct.Constant[int], TK2: ct.Constant[int],
-):
-    """dW2 = H1^T @ dh1, accumulated atomically over M-tiles."""
-    raw_pid = ct.bid(0)
-    num_pids = ct.num_blocks(0)
-    num_k2 = ct.cdiv(N1, TK2)
-    num_k3 = ct.cdiv(N2, TK2)
-    num_m = ct.cdiv(M, TM)
-    num_tiles = num_k2 * num_k3
-
-    for tile_id in range(raw_pid, num_tiles, num_pids):
-        pk2 = tile_id % num_k2
-        pk3 = tile_id // num_k2
-        dw2_acc = ct.zeros((TK2, TK2), ct.float32)
-        for pm in range(num_m):
-            h1_acc = ct.zeros((TM, TK2), ct.float32)
-            for k1 in range(ct.cdiv(K1, TK1)):
-                x_t = ct.load(X, (pm, k1), shape=(TM, TK1), latency=4)
-                w1_t = ct.load(W1, (k1, pk2), shape=(TK1, TK2), latency=4)
-                h1_acc = ct.mma(x_t, w1_t, h1_acc)
-            h1 = softplus_tile(h1_acc)
-            h1_f16 = ct.astype(h1, ct.float16)
-            h1_t = ct.transpose(h1_f16)
-            dh1_t = ct.load(DH1, (pm, pk3), shape=(TM, TK2), latency=4)
-            dw2_acc = ct.mma(h1_t, dh1_t, dw2_acc)
-        rows = ct.arange(TK2, dtype=ct.int32) + pk2 * TK2
-        cols = ct.arange(TK2, dtype=ct.int32) + pk3 * TK2
-        row_idx = ct.reshape(rows, (TK2, 1))
-        col_idx = ct.reshape(cols, (1, TK2))
-        ct.atomic_add(DW2, (row_idx, col_idx), dw2_acc)
-
-
-@ct.kernel
-def bwd_wgrad1_kernel(
-    X, W1, DH1, W2, DW1,
-    M,
-    K1: ct.Constant[int], N1: ct.Constant[int], N2: ct.Constant[int],
-    TM: ct.Constant[int], TK1: ct.Constant[int], TK2: ct.Constant[int],
-):
-    """dW1 = X^T @ dh2, accumulated atomically over M-tiles."""
-    raw_pid = ct.bid(0)
-    num_pids = ct.num_blocks(0)
-    num_k1 = ct.cdiv(K1, TK1)
-    num_k2 = ct.cdiv(N1, TK2)
-    num_m = ct.cdiv(M, TM)
-    num_tiles = num_k1 * num_k2
-
-    for tile_id in range(raw_pid, num_tiles, num_pids):
-        pk1 = tile_id % num_k1
-        pk2 = tile_id // num_k1
-        dw1_acc = ct.zeros((TK1, TK2), ct.float32)
-        for pm in range(num_m):
-            h0_acc = ct.zeros((TM, TK2), ct.float32)
-            for k1 in range(ct.cdiv(K1, TK1)):
-                x_t = ct.load(X, (pm, k1), shape=(TM, TK1), latency=4)
-                w1_t = ct.load(W1, (k1, pk2), shape=(TK1, TK2), latency=4)
-                h0_acc = ct.mma(x_t, w1_t, h0_acc)
-            dh2_acc = ct.zeros((TM, TK2), ct.float32)
-            for k2 in range(ct.cdiv(N2, TK2)):
-                dh1_t = ct.load(DH1, (pm, k2), shape=(TM, TK2), latency=4)
-                w2_t = ct.load(W2, (pk2, k2), shape=(TK2, TK2), latency=4)
-                w2_t = ct.transpose(w2_t)
-                dh2_acc = ct.mma(dh1_t, w2_t, dh2_acc)
-            dh2 = dh2_acc * softplus_grad_tile(h0_acc)
-            dh2_f16 = ct.astype(dh2, ct.float16)
-            x_t = ct.load(X, (pm, pk1), shape=(TM, TK1), latency=4)
-            x_t = ct.transpose(x_t)
-            dw1_acc = ct.mma(x_t, dh2_f16, dw1_acc)
-        rows = ct.arange(TK1, dtype=ct.int32) + pk1 * TK1
-        cols = ct.arange(TK2, dtype=ct.int32) + pk2 * TK2
-        row_idx = ct.reshape(rows, (TK1, 1))
-        col_idx = ct.reshape(cols, (1, TK2))
-        ct.atomic_add(DW1, (row_idx, col_idx), dw1_acc)
 
 
 # ============================================================
@@ -1317,180 +1161,6 @@ def fused_mlp_bwd_splitk(dout, x, w1, w2, w3, H0, H1PRE, SPLIT=None):
 
     dw = dw32.to(x.dtype)
     return dx16, dw[0:TN], dw[TN:2*TN], dw[2*TN:3*TN]
-
-
-@ct.kernel
-def bwd_fused_kernel(
-    X, W1, W2, W3, DOUT, H0, H1PRE, DX, DW1, DW2, DW3,
-    M,
-    K1: ct.Constant[int], N1: ct.Constant[int], N2: ct.Constant[int], N3: ct.Constant[int],
-    TM: ct.Constant[int], TK1: ct.Constant[int], TN: ct.Constant[int],
-):
-    """ONE fused backward megakernel (strategy B).
-
-    Contract: K1 = N1 = N2 = N3 = TN (one square weight tile per weight), and
-    K1 % TK1 == 0. Activations are loaded from global fp32 H0 (M,N1) /
-    H1_PRE (M,N2) stored by fwd_store_acts_kernel — NO recompute.
-
-    Per M-tile pm (persistent round-robin):
-      Phase A (input grads):
-        dh1[m, :] = (dout @ W3^T) * sigmoid(H1_PRE)
-        dh2[m, :] = (dh1 @ W2^T) * sigmoid(H0)
-        dx[m, k1]  = dh2 @ W1^T           (atomic_add, fp32)
-      Phase B (weight grads, accumulators held across all pm of this block):
-        dW3 += softplus(H1_PRE)^T @ dout
-        dW2 += softplus(H0)^T     @ dh1
-        dW1 += X^T                @ dh2
-    Weight-grad accumulators are flushed with one atomic_add at kernel end.
-    """
-    raw_pid = ct.bid(0)
-    num_pids = ct.num_blocks(0)
-    num_m = ct.cdiv(M, TM)
-    num_n3 = ct.cdiv(N3, TN)
-    num_k1 = ct.cdiv(K1, TK1)
-
-    # Full weight-grad accumulators (held across all pm tiles of this block):
-    # dW3 (N2,N3), dW2 (N1,N2), dW1 (K1,N1) — exactly (TN,TN) / (TN,TN) /
-    # (TK1 * num_k1, TN) == (K1, TN) when K1=TN=TK1.
-    dw3_acc = ct.zeros((TN, TN), ct.float32)
-    dw2_acc = ct.zeros((TN, TN), ct.float32)
-    dw1_acc = ct.zeros((TK1, TN), ct.float32)
-
-    for pm in range(raw_pid, num_m, num_pids):
-        # ---- dh1 = (dout @ W3^T) * sigmoid(H1_PRE) ----
-        dh1_acc = ct.zeros((TM, TN), ct.float32)
-        for k3 in range(num_n3):
-            dout_t = ct.load(DOUT, (pm, k3), shape=(TM, TN), latency=4)
-            w3_t = ct.load(W3, (0, k3), shape=(TN, TN), latency=4)
-            w3_t = ct.transpose(w3_t)
-            dh1_acc = ct.mma(dout_t, w3_t, dh1_acc)
-        h1pre_t = ct.load(H1PRE, (pm, 0), shape=(TM, TN), latency=4)
-        dh1 = dh1_acc * softplus_grad_tile(h1pre_t)   # fp32
-        dh1_f16 = ct.astype(dh1, ct.float16)
-
-        # ---- dW3 += softplus(H1_PRE)^T @ dout ----
-        h1 = softplus_tile(h1pre_t)
-        h1_f16 = ct.astype(h1, ct.float16)
-        h1_t = ct.transpose(h1_f16)
-        for pn3 in range(num_n3):
-            dout_t = ct.load(DOUT, (pm, pn3), shape=(TM, TN), latency=4)
-            dw3_acc = ct.mma(h1_t, dout_t, dw3_acc)
-
-        # ---- dh2 = (dh1 @ W2^T) * sigmoid(H0) ----
-        w2_t = ct.load(W2, (0, 0), shape=(TN, TN), latency=4)
-        w2_t = ct.transpose(w2_t)
-        dh2_acc = ct.zeros((TM, TN), ct.float32)
-        dh2_acc = ct.mma(dh1_f16, w2_t, dh2_acc)
-        h0_t = ct.load(H0, (pm, 0), shape=(TM, TN), latency=4)
-        dh2 = dh2_acc * softplus_grad_tile(h0_t)      # fp32
-        dh2_f16 = ct.astype(dh2, ct.float16)
-
-        # ---- dW2 += softplus(H0)^T @ dh1 ----
-        h0 = softplus_tile(h0_t)
-        h0_f16 = ct.astype(h0, ct.float16)
-        h0_t = ct.transpose(h0_f16)
-        dw2_acc = ct.mma(h0_t, dh1_f16, dw2_acc)
-
-        # ---- dW1 += X^T @ dh2 / dx = dh2 @ W1^T (TK1 chunks over K1) ----
-        for k1t in range(num_k1):
-            x_t = ct.load(X, (pm, k1t), shape=(TM, TK1), latency=4)
-            x_tT = ct.transpose(x_t)
-            dw1_acc = ct.mma(x_tT, dh2_f16, dw1_acc)
-
-            dx_acc = ct.zeros((TM, TK1), ct.float32)
-            w1_t = ct.load(W1, (k1t, 0), shape=(TK1, TN), latency=4)
-            w1_t = ct.transpose(w1_t)
-            dx_acc = ct.mma(dh2_f16, w1_t, dx_acc)
-            # dx[pm, k1t]: each row tile is written by exactly one block
-            # (pm tiles are partitioned round-robin), so a plain store works.
-            ct.store(DX, (pm, k1t), dx_acc)
-
-    # ---- flush weight grads (atomic_add, fp32) ----
-    rows = ct.arange(TN, dtype=ct.int32)
-    cols = ct.arange(TN, dtype=ct.int32)
-    row_idx = ct.reshape(rows, (TN, 1))
-    col_idx = ct.reshape(cols, (1, TN))
-    ct.atomic_add(DW3, (row_idx, col_idx), dw3_acc)
-    ct.atomic_add(DW2, (row_idx, col_idx), dw2_acc)
-
-    rows1 = ct.arange(TK1, dtype=ct.int32)
-    row_idx1 = ct.reshape(rows1, (TK1, 1))
-    ct.atomic_add(DW1, (row_idx1, col_idx), dw1_acc)
-
-
-def fused_mlp_bwd_cutile(dout, x, w1, w2, w3, H0=None, H1PRE=None):
-    """Strategy B backward: ONE fused kernel launch. Returns (dx, dW1, dW2, dW3).
-
-    Requires H0/H1_PRE fp32 activations from fused_mlp_fwd_store_acts.
-    Contract: K1 == N1 == N2 == N3 (single-tile square weights).
-    """
-    assert H0 is not None and H1PRE is not None, \
-        "strategy B needs stored activations H0/H1_PRE"
-    M, K1 = x.shape
-    N1 = w1.shape[1]
-    N2 = w2.shape[1]
-    N3 = w3.shape[1]
-    assert K1 == N1 == N2 == N3, \
-        f"bwd_fused_kernel requires square dims, got {K1},{N1},{N2},{N3}"
-
-    dout = dout.contiguous()
-    x = x.contiguous()
-    w1 = w1.contiguous()
-    w2 = w2.contiguous()
-    w3 = w3.contiguous()
-    H0 = H0.contiguous()
-    H1PRE = H1PRE.contiguous()
-
-    dx32 = torch.zeros((M, K1), device=x.device, dtype=torch.float32)
-    dw1_32 = torch.zeros((K1, N1), device=x.device, dtype=torch.float32)
-    dw2_32 = torch.zeros((N1, N2), device=x.device, dtype=torch.float32)
-    dw3_32 = torch.zeros((N2, N3), device=x.device, dtype=torch.float32)
-
-    stream = torch.cuda.current_stream()
-    num_sms = _get_num_sms()
-
-    # Tuned per-M backward config (GB10 exhaustive_search). Pick nearest bucket
-    # at or below M; fall back to the smallest for smaller, the largest for
-    # bigger. Untested dims fall through to TM=16/occ=1/nww=8 (the old default).
-    if K1 == N1 == N2 == N3 == 128:
-        bucket = _BWD_BUCKETS[0]
-        for b in _BWD_BUCKETS:
-            if M >= b:
-                bucket = b
-        TM, occ, nww, nctas = _BWD_TUNED[bucket]
-        if M < 16:
-            TM = min(TM, _next_pow2(M))
-    else:
-        TM, occ, nww, nctas = 16, 1, 8, 1
-        if M < 16:
-            TM = _next_pow2(M)
-    TN = K1  # single square tile per weight (dims 128 in this repo)
-    TK1 = TN
-    grid = (min(num_sms, (M + TM - 1) // TM),)
-
-    key = (occ, nww, nctas)
-    kernel = _BWD_FUSED_VARIANTS.get(key)
-    if kernel is None:
-        hints = {
-            "occupancy": occ,
-            "num_ctas": ByTarget(
-                sm_90=nctas, sm_100=nctas, sm_120=nctas,
-                sm_121=nctas, sm_89=nctas,
-            ),
-        }
-        if nww is not None:
-            hints["num_worker_warps"] = nww
-        kernel = bwd_fused_kernel.replace_hints(**hints)
-        _BWD_FUSED_VARIANTS[key] = kernel
-
-    # ONE launch: dh1, dh2, dx, dW1, dW2, dW3
-    ct.launch(stream, grid, kernel, (
-        x, w1, w2, w3, dout, H0, H1PRE, dx32, dw1_32, dw2_32, dw3_32, M,
-        K1, N1, N2, N3, TM, TK1, TN,
-    ))
-
-    return (dx32.to(x.dtype), dw1_32.to(x.dtype),
-            dw2_32.to(x.dtype), dw3_32.to(x.dtype))
 
 
 if __name__ == "__main__":
