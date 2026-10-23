@@ -177,13 +177,13 @@ for M in Ms:
         dW1 = x.T @ dh0
         return dx, dW1, dW2, dW3
 
-    # cuTile backward: direct kernel call with stored activations
-    from cutile_mlp import fused_mlp_bwd_cutile
+    # cuTile backward: direct split-K kernel call with stored activations
+    from cutile_mlp import fused_mlp_bwd_splitk
     H0_buf = h0.float().contiguous()
     H1PRE_buf = h1_pre.float().contiguous()
 
     def cutile_bwd_only():
-        return fused_mlp_bwd_cutile(dout, x, w1, w2, w3, H0_buf, H1PRE_buf)
+        return fused_mlp_bwd_splitk(dout, x, w1, w2, w3, H0_buf, H1PRE_buf)
 
     t_p = do_bench(pytorch_bwd_manual, warmup=10, rep=50) * 1000
     t_pc = do_bench(lambda: pytorch_bwd_compile(dout, x, w1, w2, w3, h0, h1_pre, h2), warmup=10, rep=50) * 1000
