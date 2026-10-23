@@ -137,28 +137,28 @@ by 1.28x** (was 1.02x with the fused backward) and also beats torch.compile
 there (1.19x). Small/mid M still favor cuBLAS-based eager — the backward
 pays activation re-reads and wgrad reduction that only amortize at large M.
 
-#### Backward only (isolated backward pass)
+#### Backward only (isolated backward pass, GB10)
 
 Backward-only comparison: PyTorch manual chain rule (no autograd overhead)
 vs torch.compile'd chain rule vs direct `fused_mlp_bwd_cutile` kernel call
 with stored fp32 activations. `do_bench` with L2 flush, warmup=10, rep=50.
 
-| M | PyTorch manual (us) | torch.compile (us) | cuTile split-K (us) | vs PyTorch | vs T.compile |
+| M | PyTorch manual (us) | torch.compile (us) | cuTile fused (us) | vs PyTorch | vs T.compile |
 |---|---|---|---|---|---|
-| 256 | 33.0 | 27.6 | **94.6** | 0.35x | 0.29x |
-| 512 | 39.9 | 35.4 | **155.3** | 0.26x | 0.23x |
-| 1024 | 59.0 | 55.8 | **165.2** | 0.36x | 0.34x |
-| 2048 | 87.7 | 73.8 | **291.7** | 0.30x | 0.25x |
-| 4096 | 118.8 | 107.1 | **209.9** | 0.57x | 0.51x |
-| 8192 | 180.7 | 152.3 | **274.5** | 0.66x | 0.55x |
-| 16384 | 366.4 | 228.8 | **412.3** | 0.89x | 0.55x |
-| 32768 | 741.9 | 495.9 | **749.9** | 0.99x | 0.66x |
-| 65536 | 1625.3 | 1237.5 | **1423.7** | **1.14x** | 0.87x |
+| 256 | 35.9 | 24.6 | **91.3** | 0.39x | 0.27x |
+| 512 | 42.6 | 35.9 | **155.6** | 0.27x | 0.23x |
+| 1024 | 57.3 | 52.8 | **160.9** | 0.36x | 0.33x |
+| 2048 | 79.3 | 72.2 | **280.0** | 0.28x | 0.26x |
+| 4096 | 118.0 | 101.5 | **210.4** | 0.56x | 0.48x |
+| 8192 | 183.4 | 150.6 | **272.6** | 0.67x | 0.55x |
+| 16384 | 370.5 | 231.1 | **415.3** | 0.89x | 0.56x |
+| 32768 | 744.8 | 505.8 | **782.6** | 0.95x | 0.65x |
+| 65536 | 1611.9 | 1230.3 | **1419.0** | **1.14x** | **1.15x** |
 
-The cuTile split-K backward **beats PyTorch manual backward at M=65536**
-(1.14x) and reaches near-parity at M=32768 (0.99x). Small M is dominated by
-the 3-kernel launch sequence (dgrad + wgrad split-K + reduce) vs PyTorch's
-single autograd engine dispatch.
+The fused cuTile backward **beats PyTorch manual backward at M=65536**
+(1.14x) and **beats torch.compile at M=65536** (1.15x). Near-parity with
+PyTorch at M=32768 (0.95x). Small M is dominated by the fixed kernel launch
+overhead of the fused megakernel vs PyTorch's cuBLAS GEMMs.
 
 ### Benchmark: cuTile vs Triton vs PyTorch (RTX 4090)
 
