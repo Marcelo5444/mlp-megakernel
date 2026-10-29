@@ -198,8 +198,10 @@ Notes:
   exact-M falls back to heuristic configs.
 - Padding waste is bounded by the 1.5x bucket step (worst 1.28x here) and
   only costs buffer memory — padded tiles do no compute.
-- IDR-sim (500 steps, M decaying 32768 -> ~512): exact-M eager 64-99s
-  (227 compile storms), bucketed eager 0.44-1.55s, bucketed+graphs 0.05s.
+- IDR-sim (500 steps, M decaying ~60K -> ~512): exact-M eager 24.1s
+  (compile storms on first-touch shapes), bucketed eager 0.66s,
+  bucketed+graphs 0.05s. Graph win grows as M shrinks: at M=256, bwd is
+  27us graph vs 78us exact-M vs 98us bucketed-eager.
 - torch.profiler traces of one full training iteration (M=5000, no graphs):
   `trace_cutile_bucketed_M5000.json` vs `trace_pytorch_eager_M5000.json`.
 

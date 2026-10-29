@@ -22,7 +22,7 @@ w1, w2, w3 = [torch.randn(D, D, dtype=DT, device=DEV) * 0.02 for _ in range(3)]
 STEPS = 500
 trace = []
 for t in range(STEPS):
-    base = max(512, round(32768 * 0.98 ** t))
+    base = max(512, round(60000 * 0.98 ** t))
     jitter = random.randint(-int(base * 0.05), int(base * 0.05))
     m = max(512, min(65536, base + jitter))
     trace.append(m)
