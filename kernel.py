@@ -156,6 +156,164 @@ def _fused_mlp_fwd(x, w1, w2, w3):
     return OUT
 
 
+
+
+# ---------------------------------------------------------------------------
+# Bucketed shapes + warmup + CUDA-graph wrapper (inference-only)
+#
+# Same bucket schedule as cutile_mlp (kept in sync manually — the two files
+# share no module by design in this monolithic-repo layout). Warmup triggers
+# one Triton JIT specialization per bucket (BM/warps constexprs derive from
+# the bucket's M via _pick_config; M itself is a runtime arg, so each bucket
+# compiles exactly ONE kernel binary, cached on disk under ~/.triton/cache).
+#
+# Graph wrapper: grid is frozen at capture from the CURRENT static-buffer M,
+# so a captured graph is valid for any M_real <= the capture M (num_tiles is
+# a frozen scalar — tiles beyond M_real are masked to no-ops by m_mask).
+# We therefore capture each bucket graph at its full bucket M. Fp16 zero-
+# or-garbage rows in the padding only write the padded OUT rows, which the
+# caller never reads (out[:M_real] view).
+# ---------------------------------------------------------------------------
+
+import os as _os
+
+TRITON_BUCKETS = (256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096,
+                  6144, 8192, 12288, 16384, 24576, 32768, 49152, 65536)
+
+def triton_bucket_for(m, buckets=TRITON_BUCKETS):
+    for b in buckets:
+        if m <= b:
+            return b
+    return buckets[-1]
+
+
+def warmup_triton_buckets(dims=(128, 128, 128, 128), buckets=TRITON_BUCKETS,
+                          dtype=torch.float16, device="cuda", verbose=True):
+    """Trigger one Triton compile per bucket (JIT cache: ~/.triton/cache,
+    overridable with TRITON_CACHE_DIR). Returns {bucket: seconds}."""
+    import time
+    K1, N1, N2, N3 = dims
+    times = {}
+    for b in buckets:
+        t0 = time.time()
+        x = torch.randn(b, K1, dtype=dtype, device=device) * 0.02
+        w1 = torch.randn(K1, N1, dtype=dtype, device=device) * 0.02
+        w2 = torch.randn(N1, N2, dtype=dtype, device=device) * 0.02
+        w3 = torch.randn(N2, N3, dtype=dtype, device=device) * 0.02
+        _fused_mlp_fwd(x, w1, w2, w3)
+        torch.cuda.synchronize()
+        times[b] = time.time() - t0
+        if verbose:
+            print(f"  [triton-warmup] bucket M={b}: {times[b]:.2f}s")
+    return times
+
+
+class GraphedBucketedTritonMLP:
+    """Bucketed static buffers + CUDA-graph fwd for the Triton megakernel.
+
+    NOTE: asymmetric with the cuTile wrapper — the Triton kernel reads M
+    from a frozen scalar, so a captured graph must apply masking (m_mask)
+    for early exit instead of a device scalar. Correct because padded OUT
+    rows are never consumed; zeroing the input padding keeps activations
+    well-defined. Graphs are captured at full bucket M and are valid for
+    every M_real <= bucket.
+
+    Eager path equally takes any M (grid derives from the buffer's bucket
+    when launched via this class; call _fused_mlp_fwd directly for exact-M).
+    """
+
+    def __init__(self, w1, w2, w3, buckets=TRITON_BUCKETS,
+                 graph_max_bucket=4096, dtype=torch.float16, device="cuda"):
+        self.w1, self.w2, self.w3 = (w.contiguous() for w in (w1, w2, w3))
+        self.dtype, self.device = dtype, device
+        self.K1, self.N1, self.N2, self.N3 = (w1.shape[0], w1.shape[1],
+                                              w2.shape[1], w3.shape[1])
+        self.buckets = tuple(buckets)
+        self.graph_max_bucket = graph_max_bucket
+        self._entries = {}
+        self._memo = {}
+
+    def _bucket(self, m):
+        b = self._memo.get(m)
+        if b is None:
+            b = triton_bucket_for(m, self.buckets)
+            self._memo[m] = b
+        return b
+
+    def _entry(self, bucket_M):
+        e = self._entries.get(bucket_M)
+        if e is None:
+            K1, N3 = self.K1, self.N3
+            e = {
+                "x": torch.zeros((bucket_M, K1), dtype=self.dtype, device=self.device),
+                "out": torch.zeros((bucket_M, N3), dtype=self.dtype, device=self.device),
+                "graphs": [],
+                "launch_args": None,
+                "grid": None,
+            }
+            self._entries[bucket_M] = e
+        return e
+
+    def _capture(self, e, bucket_M):
+        w1, w2, w3 = self.w1, self.w2, self.w3
+        BM, BN3, BK1, BK2, BK3, warps = _pick_config(
+            bucket_M, self.K1, self.N1, self.N2, self.N3,
+            fp32=(self.dtype == torch.float32))
+        num_n3 = triton.cdiv(self.N3, BN3)
+        num_m = triton.cdiv(bucket_M, BM)
+        num_tiles = num_m * num_n3
+        grid = (min(NUM_SMS, num_tiles),)
+        x, out = e["x"], e["out"]
+
+        def launch():
+            _fused_mlp_recompute[grid](
+                x, w1, w2, w3, out,
+                bucket_M, self.K1, self.N1, self.N2, self.N3,
+                x.stride(0), x.stride(1),
+                w1.stride(0), w1.stride(1),
+                w2.stride(0), w2.stride(1),
+                w3.stride(0), w3.stride(1),
+                out.stride(0), out.stride(1),
+                num_tiles, num_n3,
+                BM=BM, BN3=BN3, BK1=BK1, BK2=BK2, BK3=BK3,
+                GROUP_M=16, num_warps=warps, num_stages=1,
+            )
+        launch()  # warm/validate outside capture
+        torch.cuda.synchronize()
+        # two graphs, alternated -> a replay is never preceded on the same
+        # graph by a still-pending replay (same as the cuTile wrapper).
+        e["graphs"] = []
+        for _ in range(2):
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                launch()
+            e["graphs"].append(g)
+        e["sel"] = 0
+
+    def fwd(self, x_active):
+        """Forward on M_real active points; returns OUT[:M_real] view."""
+        m_real = x_active.shape[0]
+        bucket_M = self._bucket(m_real)
+        e = self._entry(bucket_M)
+        e["x"][:m_real].copy_(x_active, non_blocking=True)
+        # zero the padding so the frozen-M graph computes well-defined rows
+        if m_real < bucket_M:
+            e["x"][m_real:].zero_()
+        if bucket_M <= self.graph_max_bucket:
+            if not e["graphs"]:
+                self._capture(e, bucket_M)
+            sel = e["sel"]
+            e["sel"] = sel ^ 1
+            e["graphs"][sel].replay()
+        else:
+            # eager, bucket-shaped buffers (grid from bucket_M; masked rows
+            # beyond m_real produce garbage OUT rows — never consumed)
+            w1, w2, w3 = self.w1, self.w2, self.w3
+            out = _fused_mlp_fwd(e["x"], w1, w2, w3)
+            e["out"].copy_(out)
+        return e["out"][:m_real]
+
+
 # ---------------------------------------------------------------------------
 # Reference (for correctness testing)
 # ---------------------------------------------------------------------------

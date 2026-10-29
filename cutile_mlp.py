@@ -21,6 +21,13 @@ import torch
 import os
 import math
 from types import SimpleNamespace
+
+# Co-locate the cuTile compiled-kernel (cubin) cache with the repo so a
+# fresh worktree with the cache files is a genuine warm start. Must be set
+# before cuda.tile initializes its context; respect a user override.
+os.environ.setdefault(
+    "CUDA_TILE_CACHE_DIR",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cutile_cubin_cache"))
 import cuda.tile as ct
 from cuda.tile import ByTarget
 from cuda.tile.tune import exhaustive_search
@@ -423,6 +430,9 @@ def _autotune(x, w1, w2, w3, OUT, M, K1, N1, N2, N3):
         )
         _build_kernel(cfg)
         _tune_cache[cache_key] = cfg
+        _disk_cache[dk] = _cfg_to_dict(cfg)
+        _disk_cache[dk + "|train"] = _cfg_to_dict(cfg)
+        _save_disk_cache(_disk_cache)
         return cfg
 
     stream = torch.cuda.current_stream()
@@ -1491,6 +1501,596 @@ def fused_mlp_bwd_cutile(dout, x, w1, w2, w3, H0=None, H1PRE=None):
 
     return (dx32.to(x.dtype), dw1_32.to(x.dtype),
             dw2_32.to(x.dtype), dw3_32.to(x.dtype))
+
+
+# ============================================================
+# Bucketed shapes: bucket rounding, warmup, early-exit (VARLEN)
+# variants of the fwd/dgrad/wgrad kernels, and a CUDA-graph
+# wrapper (GraphedBucketedMLP) for IDR-style training where the
+# number of active points M shrinks every iteration.
+#
+# Design:
+#  - Any runtime M is rounded UP to the next bucket. Autotune runs
+#    once per bucket (warmup), persisted in the same disk cache.
+#  - Eager path: the persistent kernels are launched with M=M_real
+#    while tensors are bucket_M rows — tiles beyond M_real are never
+#    launched, so padded rows are never read or written (canary-
+#    verified). No kernel change needed.
+#  - Graph path (small buckets): the grid is frozen at bucket_M
+#    tiles; kernels get M_real via a device int32 pointer (VARLEN=1
+#    constexpr variants) and each block's tile loop is bounded by
+#    ceil(*M_real/TM). Split-K wgrad partials are ZEROED (not
+#    skipped) beyond M_real so the existing reduce kernel stays
+#    M-independent and deterministic.
+# ============================================================
+
+DEFAULT_BUCKETS = (256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096,
+                   6144, 8192, 12288, 16384, 24576, 32768, 49152, 65536)
+
+_env_buckets = os.environ.get("MLP_BUCKETS")
+if _env_buckets is not None:
+    _parsed = tuple(int(x) for x in _env_buckets.split(",") if x)
+    if _parsed:
+        DEFAULT_BUCKETS = _parsed
+
+
+def bucket_for(m, buckets=DEFAULT_BUCKETS):
+    """Round m up to the next bucket (clamped to the largest)."""
+    for b in buckets:
+        if m <= b:
+            return b
+    return buckets[-1]
+
+
+# ------------------------------------------------------------
+# VARLEN (early-exit) kernel variants — used by the CUDA-graph path.
+# M_CAP is a runtime scalar (bucket_M: grid/loop upper bound, frozen
+# at capture). M_PTR is a device int32 tensor holding M_real; each
+# block reads it and bounds its persistent tile loop by ceil(M_real/TM).
+# ------------------------------------------------------------
+
+@ct.kernel
+def fused_mlp_varlen_kernel(
+    X, W1, W2, W3, OUT, H0, H1PRE,
+    M_PTR, M_CAP,
+    K1: ct.Constant[int], N1: ct.Constant[int], N2: ct.Constant[int], N3: ct.Constant[int],
+    TM: ct.Constant[int], TN3: ct.Constant[int],
+    TK1: ct.Constant[int], TK2: ct.Constant[int], TK3: ct.Constant[int],
+    GROUP_M: ct.Constant[int],
+    LATENCY_X: ct.Constant[int], LATENCY_W1: ct.Constant[int],
+    LATENCY_W2: ct.Constant[int], LATENCY_W3: ct.Constant[int],
+    USE_TMA_X: ct.Constant[int], USE_TMA_W1: ct.Constant[int],
+    USE_TMA_W2: ct.Constant[int], USE_TMA_W3: ct.Constant[int],
+    STORE_ACTS: ct.Constant[int],
+):
+    """VARLEN forward: same math as fused_mlp_kernel, tile loop bounded by
+    the device scalar *M_PTR (M_real) instead of a launch-time M."""
+    raw_pid = ct.bid(0)
+    num_pids = ct.num_blocks(0)
+
+    zero = ct.full((1,), 0, ct.int32)
+    m_real = ct.gather(M_PTR, zero).item()
+    num_m = ct.cdiv(m_real, TM)
+    num_n3 = ct.cdiv(N3, TN3)
+    num_tiles = num_m * num_n3
+
+    for tile_id in range(raw_pid, num_tiles, num_pids):
+        group_id = tile_id // (GROUP_M * num_n3)
+        group_size = min(num_m - group_id * GROUP_M, GROUP_M)
+        pm = group_id * GROUP_M + (tile_id % group_size)
+        pn3 = (tile_id % (GROUP_M * num_n3)) // group_size
+
+        out_acc = ct.zeros((TM, TN3), ct.float32)
+
+        for k3 in range(ct.cdiv(N2, TK3)):
+            h2_acc = ct.zeros((TM, TK3), ct.float32)
+
+            for k2 in range(ct.cdiv(N1, TK2)):
+                h1_acc = ct.zeros((TM, TK2), ct.float32)
+
+                for k1 in range(ct.cdiv(K1, TK1)):
+                    x_tile = ct.load(X, (pm, k1), shape=(TM, TK1),
+                                     latency=LATENCY_X, allow_tma=bool(USE_TMA_X))
+                    w1_tile = ct.load(W1, (k1, k2), shape=(TK1, TK2),
+                                      latency=LATENCY_W1, allow_tma=bool(USE_TMA_W1))
+                    h1_acc = ct.mma(x_tile, w1_tile, h1_acc)
+
+                if STORE_ACTS and k3 == 0:
+                    ct.store(H0, (pm, k2), ct.astype(h1_acc, ct.float16))
+
+                h1_act = softplus_tile(h1_acc)
+                h1_fp16 = ct.astype(h1_act, ct.float16)
+
+                w2_tile = ct.load(W2, (k2, k3), shape=(TK2, TK3),
+                                  latency=LATENCY_W2, allow_tma=bool(USE_TMA_W2))
+                h2_acc = ct.mma(h1_fp16, w2_tile, h2_acc)
+
+            if STORE_ACTS:
+                ct.store(H1PRE, (pm, k3), ct.astype(h2_acc, ct.float16))
+
+            h2_act = softplus_tile(h2_acc)
+            h2_fp16 = ct.astype(h2_act, ct.float16)
+
+            w3_tile = ct.load(W3, (k3, pn3), shape=(TK3, TN3),
+                              latency=LATENCY_W3, allow_tma=bool(USE_TMA_W3))
+            out_acc = ct.mma(h2_fp16, w3_tile, out_acc)
+
+        ct.store(OUT, (pm, pn3), ct.astype(out_acc, ct.float16))
+
+
+@ct.kernel
+def bwd_dgrad_only_varlen_kernel(
+    X, W1, W2, W3, DOUT, H0, H1PRE, DX, DH1, P1,
+    M_PTR, M_CAP,
+    K1: ct.Constant[int], N1: ct.Constant[int], N2: ct.Constant[int], N3: ct.Constant[int],
+    TM: ct.Constant[int], TN: ct.Constant[int],
+    LATENCY: ct.Constant[int],
+):
+    """VARLEN dgrad: tile loop bounded by *M_PTR. The per-block dW1
+    partial (P1) is a pure function of the (varlen) tiles visited, so
+    the downstream reduce stays M-independent."""
+    raw_pid = ct.bid(0)
+    num_pids = ct.num_blocks(0)
+    zero = ct.full((1,), 0, ct.int32)
+    m_real = ct.gather(M_PTR, zero).item()
+    num_m = ct.cdiv(m_real, TM)
+
+    dw1_acc = ct.zeros((TN, TN), ct.float32)
+
+    for pm in range(raw_pid, num_m, num_pids):
+        dout_t = ct.load(DOUT, (pm, 0), shape=(TM, TN), latency=LATENCY)
+        w3_t = ct.load(W3, (0, 0), shape=(TN, TN), latency=LATENCY)
+        w3_t = ct.transpose(w3_t)
+        dh1_acc = ct.zeros((TM, TN), ct.float32)
+        dh1_acc = ct.mma(dout_t, w3_t, dh1_acc)
+        h1pre_t = ct.load(H1PRE, (pm, 0), shape=(TM, TN), latency=LATENCY)
+        dh1 = dh1_acc * softplus_grad_tile(h1pre_t)
+        dh1_f16 = ct.astype(dh1, ct.float16)
+        ct.store(DH1, (pm, 0), dh1_f16)
+
+        w2_t = ct.load(W2, (0, 0), shape=(TN, TN), latency=LATENCY)
+        w2_t = ct.transpose(w2_t)
+        dh2_acc = ct.zeros((TM, TN), ct.float32)
+        dh2_acc = ct.mma(dh1_f16, w2_t, dh2_acc)
+        h0_t = ct.load(H0, (pm, 0), shape=(TM, TN), latency=LATENCY)
+        dh2 = dh2_acc * softplus_grad_tile(h0_t)
+        dh2_f16 = ct.astype(dh2, ct.float16)
+
+        x_t = ct.load(X, (pm, 0), shape=(TM, TN), latency=LATENCY)
+        w1_t = ct.load(W1, (0, 0), shape=(TN, TN), latency=LATENCY)
+        w1_t = ct.transpose(w1_t)
+        dx_acc = ct.zeros((TM, TN), ct.float32)
+        dx_acc = ct.mma(dh2_f16, w1_t, dx_acc)
+        ct.store(DX, (pm, 0), ct.astype(dx_acc, ct.float16))
+        x_f16 = ct.astype(x_t, ct.float16)
+        x_tT = ct.transpose(x_f16)
+        dw1_acc = ct.mma(x_tT, dh2_f16, dw1_acc)
+
+    ct.store(P1, (raw_pid, 0), dw1_acc)
+
+
+@ct.kernel
+def bwd_wgrad_splitk_varlen_kernel(
+    A, B, P,
+    M_PTR, M_CAP,
+    KA: ct.Constant[int], NB: ct.Constant[int],
+    TM: ct.Constant[int], SPLIT: ct.Constant[int],
+    LATENCY: ct.Constant[int],
+):
+    """VARLEN split-K wgrad: blocks whose K-chunk lies entirely beyond
+    M_real store a ZERO partial (never skip the store) so the frozen
+    reduce kernel sees exactly SPLIT partials, deterministic."""
+    sid = ct.bid(0)
+    num_pids = ct.num_blocks(0)
+    zero = ct.full((1,), 0, ct.int32)
+    m_real = ct.gather(M_PTR, zero).item()
+    num_m = ct.cdiv(m_real, TM)
+
+    acc = ct.zeros((KA, NB), ct.float32)
+    for pm in range(sid, num_m, num_pids):
+        a_t = ct.load(A, (pm, 0), shape=(TM, KA), latency=LATENCY)
+        a_t = ct.transpose(a_t)
+        b_t = ct.load(B, (pm, 0), shape=(TM, NB), latency=LATENCY)
+        acc = ct.mma(a_t, b_t, acc)
+    ct.store(P, (sid, 0), acc)
+
+
+@ct.kernel
+def bwd_wgrad_splitk_act_varlen_kernel(
+    PRE, B, P,
+    M_PTR, M_CAP,
+    KA: ct.Constant[int], NB: ct.Constant[int],
+    TM: ct.Constant[int], SPLIT: ct.Constant[int],
+    LATENCY: ct.Constant[int],
+):
+    """VARLEN split-K wgrad with A recomputed from fp16 pre-acts (zero
+    partial beyond M_real; see bwd_wgrad_splitk_varlen_kernel)."""
+    sid = ct.bid(0)
+    num_pids = ct.num_blocks(0)
+    zero = ct.full((1,), 0, ct.int32)
+    m_real = ct.gather(M_PTR, zero).item()
+    num_m = ct.cdiv(m_real, TM)
+
+    acc = ct.zeros((KA, NB), ct.float32)
+    for pm in range(sid, num_m, num_pids):
+        pre_t = ct.load(PRE, (pm, 0), shape=(TM, KA), latency=LATENCY)
+        pre32 = ct.astype(pre_t, ct.float32)
+        a32 = softplus_tile(pre32) * softplus_grad_tile(pre32)
+        a_t = ct.transpose(ct.astype(a32, ct.float16))
+        b_t = ct.load(B, (pm, 0), shape=(TM, NB), latency=LATENCY)
+        acc = ct.mma(a_t, b_t, acc)
+    ct.store(P, (sid, 0), acc)
+
+
+_VARLEN_FWD_VARIANTS = {}
+
+
+def _build_varlen_fwd_kernel(cfg, store_acts):
+    """Compiled VARLEN fwd kernel for (hints, STORE_ACTS), cached by hint tuple."""
+    key = (cfg.occupancy, getattr(cfg, "num_worker_warps", None),
+           getattr(cfg, "num_ctas", 1), store_acts)
+    k = _VARLEN_FWD_VARIANTS.get(key)
+    if k is None:
+        k = fused_mlp_varlen_kernel.replace_hints(**_kernel_hints(cfg))
+        _VARLEN_FWD_VARIANTS[key] = k
+    return k
+
+
+# ------------------------------------------------------------
+# Warmup: autotune/compile every bucket ONCE, persist to disk cache.
+# ------------------------------------------------------------
+
+def warmup_buckets(dims=(128, 128, 128, 128), buckets=DEFAULT_BUCKETS,
+                   dtype=torch.float16, device="cuda", verbose=True):
+    """Autotune the fwd kernel (inference + train variants) once per bucket.
+
+    Everything lands in _disk_cache (.cutile_tune_cache.json), so a warm
+    start re-loads configs from disk and only pays replace_hints compile.
+    Returns {bucket_M: seconds}.
+    """
+    import time
+    K1, N1, N2, N3 = dims
+    timings = {}
+    for b in buckets:
+        t0 = time.time()
+        x = torch.randn(b, K1, dtype=dtype, device=device) * 0.02
+        w1 = torch.randn(K1, N1, dtype=dtype, device=device) * 0.02
+        w2 = torch.randn(N1, N2, dtype=dtype, device=device) * 0.02
+        w3 = torch.randn(N2, N3, dtype=dtype, device=device) * 0.02
+        OUT = torch.empty((b, N3), dtype=dtype, device=device)
+        _autotune(x, w1, w2, w3, OUT, b, K1, N1, N2, N3)
+        # Pre-build the train variant too (replace_hints compile only;
+        # the train CONFIG was tuned inside _autotune).
+        cc = torch.cuda.get_device_capability()
+        dk = _disk_key((cc[0], cc[1], b, K1, N1, N2, N3)) + "|train"
+        if dk in _disk_cache:
+            cfg_tr = _cfg_from_dict(_disk_cache[dk])
+            _build_kernel(cfg_tr, store_acts=1)
+            # Pre-compile the VARLEN train variant (graph path) so first use
+            # inside GraphedBucketedMLP is capture-only, no compile storm.
+            _build_varlen_fwd_kernel(cfg_tr, store_acts=1)
+        torch.cuda.synchronize()
+        timings[b] = time.time() - t0
+        if verbose:
+            print(f"  [warmup] bucket M={b}: {timings[b]:.1f}s")
+        del x, w1, w2, w3, OUT
+    # Pre-compile the split-K bwd VARLEN variants (hint tuples are fixed
+    # for the square-dims path, so this is exactly 3 compiles, arch-wide).
+    _bwd_splitk_hinted(bwd_dgrad_only_varlen_kernel, 1, 8)
+    _bwd_splitk_hinted(bwd_wgrad_splitk_act_varlen_kernel, 1, 4)
+    _bwd_splitk_hinted(bwd_wgrad_reduce_kernel, 1, None)
+    return timings
+
+
+def warmup_graphs(w1, w2, w3, buckets=DEFAULT_BUCKETS, graph_max_bucket=4096,
+                  dtype=torch.float16, device="cuda", verbose=True):
+    """Preflight: capture fwd+bwd graphs for every bucket <= graph_max_bucket.
+
+    Moves the ~1-3 s/bucket graph-capture cost out of the training loop and
+    into startup. Pass keep=True's counterpart: the returned wrapper holds
+    the graphs alive for the process lifetime.
+    """
+    gm = GraphedBucketedMLP(w1, w2, w3, buckets=buckets,
+                            graph_max_bucket=graph_max_bucket,
+                            dtype=dtype, device=device)
+    import time
+    K1 = w1.shape[0]
+    for b in buckets:
+        if b > graph_max_bucket:
+            continue
+        t0 = time.time()
+        x = torch.zeros(b, K1, dtype=dtype, device=device)
+        dout = torch.zeros(b, K1, dtype=dtype, device=device)
+        gm.fwd(x)
+        gm.bwd(dout)
+        torch.cuda.synchronize()
+        if verbose:
+            print(f"  [warmup-graphs] bucket M={b}: {time.time()-t0:.1f}s")
+    return gm
+
+
+# ------------------------------------------------------------
+# Bucketed eager launcher: buffers at bucket_M rows, grid/loop from
+# M_real — padded tiles are never launched (canary-verified).
+# ------------------------------------------------------------
+
+def _launch_fwd_bucketed(x_b, w1, w2, w3, out_b, m_real, store_acts=0,
+                         h0_b=None, h1pre_b=None):
+    """Launch the persistent fwd kernel with M=m_real on bucket_M-row tensors."""
+    bucket_M = x_b.shape[0]
+    K1 = x_b.shape[1]
+    N1, N2, N3 = w1.shape[1], w2.shape[1], w3.shape[1]
+    cc = torch.cuda.get_device_capability()
+    key = (cc[0], cc[1], bucket_M, K1, N1, N2, N3)
+    if store_acts:
+        dk = _disk_key(key) + "|train"
+        cfg = (_cfg_from_dict(_disk_cache[dk]) if dk in _disk_cache
+               else _tune_cache.get(key))
+    else:
+        cfg = _tune_cache.get(key)
+        if cfg is None:
+            cfg = _autotune(x_b, w1, w2, w3, out_b, bucket_M, K1, N1, N2, N3)
+    if cfg is None:
+        cfg = _autotune(x_b, w1, w2, w3, out_b, bucket_M, K1, N1, N2, N3)
+    kernel = _build_kernel(cfg, store_acts=store_acts)
+    num_sms = _get_num_sms()
+    num_tiles = ((m_real + cfg.TM - 1) // cfg.TM) * ((N3 + cfg.TN3 - 1) // cfg.TN3)
+    grid = (min(num_sms, num_tiles),)
+    if store_acts == 0:
+        h0_b = torch.empty(1, device=x_b.device, dtype=torch.float32)
+        h1pre_b = torch.empty(1, device=x_b.device, dtype=torch.float32)
+    ct.launch(torch.cuda.current_stream(), grid, kernel, (
+        x_b, w1, w2, w3, out_b, h0_b, h1pre_b, m_real,
+        K1, N1, N2, N3,
+        cfg.TM, cfg.TN3, cfg.TK1, cfg.TK2, cfg.TK3, cfg.GROUP_M,
+        cfg.latency_x, cfg.latency_w1, cfg.latency_w2, cfg.latency_w3,
+        cfg.use_tma & 1, (cfg.use_tma >> 1) & 1,
+        (cfg.use_tma >> 2) & 1, (cfg.use_tma >> 3) & 1,
+        store_acts,
+    ))
+    return cfg
+
+
+# ------------------------------------------------------------
+# CUDA-graph wrapper for small buckets (IDR-style shrinking M).
+# ------------------------------------------------------------
+
+class GraphedBucketedMLP:
+    """Per-bucket static buffers + captured fwd/bwd CUDA graphs.
+
+    Usage:
+        gm = GraphedBucketedMLP(w1, w2, w3, buckets=(256, 512, 1024))
+        out = gm.fwd(x_active)            # x_active: (M_real, K1) fp16
+        ...                               # loss on out[:M_real]
+        dx, dw1, dw2, dw3 = gm.bwd(dout_active, M_real)
+
+    - M_real is rounded up to the smallest captured bucket >= M_real.
+    - fwd/bwd graphs are captured once per bucket (first touch).
+    - M_real is handed to the kernels via a device int32 scalar
+      (zero-copy D2D update), so one frozen graph serves every M_real
+      in the bucket; tiles beyond M_real early-exit and split-K
+      wgrad partials are zeroed deterministically.
+    """
+
+    def __init__(self, w1, w2, w3, buckets=DEFAULT_BUCKETS,
+                 graph_max_bucket=4096, dtype=torch.float16, device="cuda"):
+        self.w1, self.w2, self.w3 = (w.contiguous() for w in (w1, w2, w3))
+        self.dtype, self.device = dtype, device
+        self.K1 = w1.shape[0]
+        self.N1, self.N2, self.N3 = w1.shape[1], w2.shape[1], w3.shape[1]
+        assert self.K1 == self.N1 == self.N2 == self.N3, \
+            "graph wrapper targets the square-dims (128) split-K path"
+        self.buckets = tuple(b for b in buckets)
+        self.graph_max_bucket = graph_max_bucket
+        self._entries = {}  # bucket -> dict of buffers/graphs/cfg
+        self._num_sms = _get_num_sms()
+        self._bucket_memo = {}
+
+    def _last_bucket_for(self, m):
+        b = self._bucket_memo.get(m)
+        if b is None:
+            b = bucket_for(m, self.buckets)
+            self._bucket_memo[m] = b
+        return b
+
+    # -- per-bucket state ----------------------------------------
+    def _get_entry(self, bucket_M, want_graph):
+        e = self._entries.get(bucket_M)
+        if e is None:
+            K1, N1, N2, N3 = self.K1, self.N1, self.N2, self.N3
+            dev, dt = self.device, self.dtype
+            cc = torch.cuda.get_device_capability()
+            key = (cc[0], cc[1], bucket_M, K1, N1, N2, N3)
+            # Configs must exist — run warmup_buckets() first (or autotune
+            # on demand here).
+            if key not in _tune_cache:
+                x_tmp = torch.randn(bucket_M, K1, dtype=dt, device=dev) * 0.02
+                OUT_tmp = torch.empty((bucket_M, N3), dtype=dt, device=dev)
+                _autotune(x_tmp, self.w1, self.w2, self.w3, OUT_tmp,
+                          bucket_M, K1, N1, N2, N3)
+                del x_tmp, OUT_tmp
+            dk = _disk_key(key) + "|train"
+            cfg_inf = _tune_cache[key]
+            cfg_tr = (_cfg_from_dict(_disk_cache[dk]) if dk in _disk_cache
+                      else cfg_inf)
+            e = {
+                "cfg_inf": cfg_inf, "cfg_tr": cfg_tr,
+                "x": torch.zeros((bucket_M, K1), dtype=dt, device=dev),
+                "out": torch.zeros((bucket_M, N3), dtype=dt, device=dev),
+                "h0": torch.zeros((bucket_M, N1), dtype=dt, device=dev),
+                "h1pre": torch.zeros((bucket_M, N2), dtype=dt, device=dev),
+                "dout": torch.zeros((bucket_M, N3), dtype=dt, device=dev),
+                "dx": torch.zeros((bucket_M, K1), dtype=dt, device=dev),
+                "dh1": torch.zeros((bucket_M, N1), dtype=dt, device=dev),
+                "m_ptr": torch.zeros(1, dtype=torch.int32, device=dev),
+                "m_host": torch.zeros(1, dtype=torch.int32, pin_memory=True),
+                "fwd_graph": None, "bwd_graph": None,
+                "fwd_grid": None, "bwd_grids": None,
+            }
+            self._entries[bucket_M] = e
+        e["use_graph"] = want_graph and bucket_M <= self.graph_max_bucket
+        return e
+
+    # -- graph capture --------------------------------------------
+    def _capture_fwd(self, e, bucket_M):
+        cfg = e["cfg_tr"]
+        kernel = _build_varlen_fwd_kernel(cfg, store_acts=1)
+        num_tiles_cap = (bucket_M // cfg.TM) * ((self.N3 + cfg.TN3 - 1) // cfg.TN3)
+        grid = (min(self._num_sms, num_tiles_cap),)
+        K1, N1, N2, N3 = self.K1, self.N1, self.N2, self.N3
+
+        def launch():
+            ct.launch(torch.cuda.current_stream(), grid, kernel, (
+                e["x"], self.w1, self.w2, self.w3, e["out"], e["h0"], e["h1pre"],
+                e["m_ptr"], bucket_M,
+                K1, N1, N2, N3,
+                cfg.TM, cfg.TN3, cfg.TK1, cfg.TK2, cfg.TK3, cfg.GROUP_M,
+                cfg.latency_x, cfg.latency_w1, cfg.latency_w2, cfg.latency_w3,
+                cfg.use_tma & 1, (cfg.use_tma >> 1) & 1,
+                (cfg.use_tma >> 2) & 1, (cfg.use_tma >> 3) & 1,
+                1,
+            ))
+        e["m_ptr"].fill_(bucket_M)
+        # Cold-run validation on SCRATCH copies (replace_hints compiles a new
+        # kernel; an invalid config must fail here, not inside graph capture).
+        # Scratch so trial garbage never lands in the static buffers.
+        sc = {k: torch.zeros((bucket_M, self.K1), dtype=self.dtype, device=self.device)
+              for k in ("x", "out", "h0", "h1pre")}
+        saved = (e["x"], e["out"], e["h0"], e["h1pre"])
+        e["x"], e["out"], e["h0"], e["h1pre"] = sc["x"], sc["out"], sc["h0"], sc["h1pre"]
+        try:
+            launch()
+            torch.cuda.synchronize()
+        finally:
+            e["x"], e["out"], e["h0"], e["h1pre"] = saved
+        del sc
+        for slot in ("fwd_graph_a", "fwd_graph_b"):
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                launch()
+            e[slot] = g
+        e["fwd_sel"] = 0
+        e["fwd_grid"] = grid
+
+    def _capture_bwd(self, e, bucket_M):
+        K1 = N1 = N2 = N3 = self.K1
+        TN = K1
+        TM = 16
+        num_m_cap = bucket_M // TM
+        nb = min(self._num_sms, num_m_cap)
+        SPLIT = min(128, num_m_cap)
+        P = torch.zeros(((nb + 2 * SPLIT) * TN, TN), device=self.device,
+                        dtype=torch.float32)
+        P1, P2, P3 = P[0:nb*TN], P[nb*TN:nb*TN + SPLIT*TN], P[nb*TN + SPLIT*TN:]
+        dw32 = torch.zeros((3 * TN, TN), device=self.device, dtype=torch.float32)
+        k_dgrad = _bwd_splitk_hinted(bwd_dgrad_only_varlen_kernel, 1, 8)
+        k_wga = _bwd_splitk_hinted(bwd_wgrad_splitk_act_varlen_kernel, 1, 4)
+        k_red = _bwd_splitk_hinted(bwd_wgrad_reduce_kernel, 1, None)
+        TR, TC = 8, 32
+        grid_r = ((TN // TR) * (TN // TC),)
+
+        def launch():
+            s = torch.cuda.current_stream()
+            ct.launch(s, (nb,), k_dgrad, (
+                e["x"], self.w1, self.w2, self.w3, e["dout"],
+                e["h0"], e["h1pre"], e["dx"], e["dh1"], P1,
+                e["m_ptr"], bucket_M, K1, N1, N2, N3, TM, TN, 4,
+            ))
+            ct.launch(s, (SPLIT,), k_wga,
+                      (e["h0"], e["dh1"], P2, e["m_ptr"], bucket_M,
+                       N1, N2, TM, SPLIT, 4))
+            ct.launch(s, (SPLIT,), k_wga,
+                      (e["h1pre"], e["dout"], P3, e["m_ptr"], bucket_M,
+                       N2, N3, TM, SPLIT, 4))
+            ct.launch(s, grid_r, k_red, (P1, dw32[0:TN], nb, TR, TC))
+            ct.launch(s, grid_r, k_red, (P2, dw32[TN:2*TN], SPLIT, TR, TC))
+            ct.launch(s, grid_r, k_red, (P3, dw32[2*TN:3*TN], SPLIT, TR, TC))
+
+        e["m_ptr"].fill_(bucket_M)
+        # Cold-run validation on scratch buffers (see _capture_fwd note).
+        saved = {k: e[k] for k in ("x", "dout", "h0", "h1pre", "dx", "dh1")}
+        for k in ("x", "dout", "h0", "h1pre", "dx", "dh1"):
+            e[k] = torch.zeros((bucket_M, self.K1), dtype=self.dtype, device=self.device)
+        try:
+            launch()
+            torch.cuda.synchronize()
+        finally:
+            e.update(saved)
+        for slot in ("bwd_graph_a", "bwd_graph_b"):
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g):
+                launch()
+            e[slot] = g
+        e["bwd_sel"] = 0
+        e["P"], e["dw32"] = P, dw32
+
+    # -- public API -----------------------------------------------
+    def fwd(self, x_active):
+        """Forward on M_real active points. Returns OUT view [:M_real]."""
+        m_real = x_active.shape[0]
+        bucket_M = self._last_bucket_for(m_real)
+        e = self._get_entry(bucket_M, want_graph=True)
+        e["x"][:m_real].copy_(x_active, non_blocking=True)
+        # Zero the straddle window: the fwd kernel (graph path) computes the
+        # partial tile containing row m_real-1 in full, and rows in
+        # [m_real, tile_end) are IN-BOUNDS of the bucket buffer — stale data
+        # there would flow into h0/h1pre and poison the wgrad reduction.
+        # Zeroing a <=128-row window is ~free and makes those rows well-
+        # defined (0), so all straddling wgrad contributions are exactly 0.
+        end = ((m_real + 127) // 128) * 128
+        if end > m_real:
+            e["x"][m_real:end].zero_()
+        if e["use_graph"]:
+            g = e.get("_fwd_cur")
+            if g is None:
+                if e.get("fwd_graph_a") is None:
+                    self._capture_fwd(e, bucket_M)
+                g = e["fwd_graph_a"]
+            e["m_host"][0] = m_real
+            e["m_ptr"].copy_(e["m_host"], non_blocking=True)  # async H2D
+            e["_fwd_cur"] = e["fwd_graph_b"] if g is e["fwd_graph_a"] else e["fwd_graph_a"]
+            g.replay()
+        else:
+            _launch_fwd_bucketed(e["x"], self.w1, self.w2, self.w3,
+                                 e["out"], m_real, store_acts=1,
+                                 h0_b=e["h0"], h1pre_b=e["h1pre"])
+        e["m_real"] = m_real
+        return e["out"][:m_real]
+
+    def bwd(self, dout_active):
+        """Backward for the last fwd call. Returns (dx, dw1, dw2, dw3).
+
+        NOTE (graph path): dx/dw outputs are VIEWS of static buffers, valid
+        until the next bwd() on the same bucket — the training loop must
+        consume or clone them before then. This avoids ~30us/copy of D2D
+        traffic that would otherwise dominate small-bucket steps.
+        """
+        m_real = dout_active.shape[0]
+        bucket_M = self._last_bucket_for(m_real)
+        e = self._entries[bucket_M]
+        e["dout"][:m_real].copy_(dout_active, non_blocking=True)
+        # Same straddle-window zeroing for dout: dh1 = (dout @ W3^T) * sig is
+        # computed over full 16-row tiles; garbage rows would leak into dW2/dW3.
+        end = ((m_real + 127) // 128) * 128
+        if end > m_real:
+            e["dout"][m_real:end].zero_()
+        if e["use_graph"]:
+            g = e.get("_bwd_cur")
+            if g is None:
+                if e.get("bwd_graph_a") is None:
+                    self._capture_bwd(e, bucket_M)
+                g = e["bwd_graph_a"]
+            e["m_host"][0] = m_real
+            e["m_ptr"].copy_(e["m_host"], non_blocking=True)
+            e["_bwd_cur"] = e["bwd_graph_b"] if g is e["bwd_graph_a"] else e["bwd_graph_a"]
+            g.replay()
+            dw = e["dw32"]
+            return (e["dx"][:m_real], dw[0:self.K1],
+                    dw[self.K1:2*self.K1], dw[2*self.K1:3*self.K1])
+        dx, dw1, dw2, dw3 = fused_mlp_bwd_splitk(
+            e["dout"][:m_real], e["x"][:m_real], self.w1, self.w2, self.w3,
+            e["h0"][:m_real], e["h1pre"][:m_real])
+        return dx, dw1, dw2, dw3
 
 
 if __name__ == "__main__":
