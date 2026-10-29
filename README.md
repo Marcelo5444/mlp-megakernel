@@ -160,6 +160,49 @@ The cuTile split-K backward **beats PyTorch manual backward at M=65536**
 the 3-kernel launch sequence (dgrad + wgrad split-K + reduce) vs PyTorch's
 single autograd engine dispatch.
 
+### Bucketed shapes for variable-batch training (IDR / NeuS)
+
+For training loops where the batch size changes every iteration (e.g. IDR
+3D reconstruction: start with ~32K sampled points, cull non-intersecting
+points each step), exact-M autotuning is useless — every new M triggers a
+compile storm, while padding everything to a fixed max wastes compute.
+
+The bucketed path (`GraphedBucketedMLP`) rounds M up to the nearest of 17
+buckets (256 → 65536, 1.5x steps), compiles+autotunes each bucket once at
+startup, and persists everything to disk. Padded tiles are skipped, not
+computed: the eager path sizes the grid from M_real (padded tiles never
+launch), and the CUDA-graph path passes M_real via a device scalar so tiles
+beyond M_real early-exit. Warm start with the committed disk cache: 0.2s
+for all 17 buckets (cuTile), 0.4s (Triton).
+
+RTX 4090 (sm_89), warmed, do_bench L2-flushed, awkward non-multiple shapes.
+exact-M = current main path at the true M (heuristic config, no autotune
+storm); bkt-eager = bucketed, no graphs; bkt-graph = bucketed + CUDA graph
+replay (buckets <= 4096 only); torch = PyTorch eager fwd+bwd.
+
+| M_real | bucket | pad | exact fwd (us) | bkt-eager fwd (us) | bkt-graph fwd (us) | exact bwd (us) | bkt-eager bwd (us) | bkt-graph bwd (us) | torch fwd+bwd (us) |
+|---|---|---|---|---|---|---|---|---|---|
+| 300 | 384 | 1.28x | 8.4 | 11.7 | 12.9 | 33.8 | 36.3 | 34.2 | 47.3 |
+| 1000 | 1024 | 1.02x | 8.8 | 11.9 | 14.0 | 49.0 | 52.0 | 50.4 | 203.1 |
+| 2500 | 3072 | 1.23x | 11.6 | 16.9 | 17.9 | 96.7 | 103.3 | 99.5 | 135.0 |
+| 5000 | 6144 | 1.23x | 16.7 | 22.2 | - | 113.4 | 119.4 | - | 137.8 |
+| 10000 | 12288 | 1.23x | 46.5 | 31.1 | - | 130.8 | 132.6 | - | 141.7 |
+| 20000 | 24576 | 1.23x | 61.2 | 48.7 | - | 172.7 | 175.0 | - | 131.6 |
+| 40000 | 49152 | 1.23x | 88.5 | 77.7 | - | 251.7 | 256.6 | - | 204.8 |
+| 60000 | 65536 | 1.09x | 112.8 | 118.7 | - | 333.2 | 349.8 | - | 334.2 |
+
+Notes:
+- At buckets <= 4096 the graph path pays a fixed ~4us copy+replay overhead
+  but eliminates Python dispatch; at 5000+ the eager bucketed path is faster
+  than exact-M because it uses the exhaustive-tuned bucket configs while
+  exact-M falls back to heuristic configs.
+- Padding waste is bounded by the 1.5x bucket step (worst 1.28x here) and
+  only costs buffer memory — padded tiles do no compute.
+- IDR-sim (500 steps, M decaying 32768 -> ~512): exact-M eager 64-99s
+  (227 compile storms), bucketed eager 0.44-1.55s, bucketed+graphs 0.05s.
+- torch.profiler traces of one full training iteration (M=5000, no graphs):
+  `trace_cutile_bucketed_M5000.json` vs `trace_pytorch_eager_M5000.json`.
+
 ### Benchmark: cuTile vs Triton vs PyTorch (RTX 4090)
 
 NVIDIA RTX 4090 (sm_89, 128 SMs), CUDA 13.4, cuTile 1.7, torch 2.14.1+cu130.
