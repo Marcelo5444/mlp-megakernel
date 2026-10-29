@@ -430,8 +430,13 @@ def _autotune(x, w1, w2, w3, OUT, M, K1, N1, N2, N3):
         )
         _build_kernel(cfg)
         _tune_cache[cache_key] = cfg
-        _disk_cache[dk] = _cfg_to_dict(cfg)
-        _disk_cache[dk + "|train"] = _cfg_to_dict(cfg)
+        # CRITICAL: never overwrite an existing exhaustive entry with a
+        # heuristic config — the disk cache is the source of truth for the
+        # expensive autotune results.
+        if dk not in _disk_cache:
+            _disk_cache[dk] = _cfg_to_dict(cfg)
+        if dk + "|train" not in _disk_cache:
+            _disk_cache[dk + "|train"] = _cfg_to_dict(cfg)
         _save_disk_cache(_disk_cache)
         return cfg
 
